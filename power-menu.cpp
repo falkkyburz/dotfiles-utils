@@ -4,8 +4,6 @@
 #include <QObject>
 #include <QDBusConnection>
 #include <QDBusInterface>
-#include <QDBusReply>
-#include <QDBusVariant>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickStyle>
@@ -15,13 +13,13 @@
 #include <QtLogging>
 
 namespace {
-constexpr auto service = "org.freedesktop.UPower.PowerProfiles";
-constexpr auto path = "/org/freedesktop/UPower/PowerProfiles";
-constexpr auto interface = "org.freedesktop.UPower.PowerProfiles";
+constexpr auto service = "net.hadess.PowerProfiles";
+constexpr auto path = "/net/hadess/PowerProfiles";
+constexpr auto interface = "net.hadess.PowerProfiles";
 
-QDBusInterface propertiesInterface()
+QDBusInterface powerProfilesInterface()
 {
-    return QDBusInterface(service, path, "org.freedesktop.DBus.Properties", QDBusConnection::systemBus());
+    return QDBusInterface(service, path, interface, QDBusConnection::systemBus());
 }
 }
 
@@ -36,10 +34,9 @@ public:
 
     Q_INVOKABLE void setProfile(const QString &profile)
     {
-        auto properties = propertiesInterface();
-        const QDBusReply<void> reply = properties.call("Set", interface, "ActiveProfile", QVariant::fromValue(QDBusVariant(profile)));
-        if (!reply.isValid()) {
-            qWarning().noquote() << "Failed to set power profile" << profile;
+        auto powerProfiles = powerProfilesInterface();
+        if (!powerProfiles.setProperty("ActiveProfile", profile)) {
+            qWarning().noquote() << "Failed to set power profile" << profile << powerProfiles.lastError().message();
         }
         QGuiApplication::quit();
     }
@@ -49,15 +46,18 @@ private:
 
     static QString readCurrentProfile()
     {
-        auto properties = propertiesInterface();
-        const QDBusReply<QVariant> reply = properties.call("Get", interface, "ActiveProfile");
-        if (!reply.isValid()) {
-            qWarning().noquote() << "Failed to read current power profile";
+        auto powerProfiles = powerProfilesInterface();
+        const QString profile = powerProfiles.property("ActiveProfile").toString();
+        if (!powerProfiles.lastError().isValid() && !profile.isEmpty()) {
+            return profile;
+        }
+
+        if (powerProfiles.lastError().isValid()) {
+            qWarning().noquote() << "Failed to read current power profile" << powerProfiles.lastError().message();
             return "balanced";
         }
 
-        const QString profile = reply.value().value<QDBusVariant>().variant().toString();
-        return profile.isEmpty() ? QStringLiteral("balanced") : profile;
+        return QStringLiteral("balanced");
     }
 };
 

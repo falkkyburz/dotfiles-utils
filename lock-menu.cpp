@@ -18,8 +18,8 @@ public:
 
     Q_INVOKABLE void lock() { run("hyprlock"); }
     Q_INVOKABLE void suspend() { run("systemctl", {"suspend"}); }
-    Q_INVOKABLE void reboot() { run("systemctl", {"reboot"}); }
-    Q_INVOKABLE void shutdown() { run("systemctl", {"poweroff"}); }
+    Q_INVOKABLE void reboot() { run("hyprshutdown", {"--top-label", "Rebooting...", "--post-cmd", "systemctl reboot"}); }
+    Q_INVOKABLE void shutdown() { run("hyprshutdown", {"--top-label", "Shutting down...", "--post-cmd", "systemctl poweroff"}); }
 
 private:
     void run(const QString &program, const QStringList &arguments = {})

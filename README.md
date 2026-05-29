@@ -7,6 +7,7 @@ Small Qt/QML menus for Hyprland.
 ```sh
 cmake --preset debug
 cmake --build --preset debug
+cmake --install build/debug
 ```
 
 ## Hyprland Launch Commands

@@ -84,12 +84,21 @@ qt_add_executable(idle-menu
     idle-menu.cpp
 )
 
+qt_add_executable(clocks
+    clocks.cpp
+)
+
 add_executable(minibar minibar.cpp ${WLR_CODE} ${XDG_CODE})
 add_dependencies(minibar minibar_protocol_bindings)
+add_executable(screenfreeze screenfreeze.cpp ${WLR_CODE} ${XDG_CODE})
+add_dependencies(screenfreeze minibar_protocol_bindings)
 set_source_files_properties(${WLR_CODE} ${XDG_CODE} PROPERTIES LANGUAGE C)
 set_target_properties(minibar PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+set_target_properties(screenfreeze PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 target_compile_options(minibar PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(screenfreeze PRIVATE -Wall -Wextra -Wpedantic)
 target_include_directories(minibar PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+target_include_directories(screenfreeze PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 target_link_libraries(lock-menu
     PRIVATE
@@ -137,11 +146,36 @@ target_link_libraries(idle-menu
         Qt6::QuickControls2
 )
 
+target_compile_definitions(clocks
+    PRIVATE
+        CLOCKS_SOUND_DIR="${CMAKE_CURRENT_SOURCE_DIR}/sound"
+)
+
+target_link_libraries(clocks
+    PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Qml
+        Qt6::Quick
+        Qt6::QuickControls2
+)
+
+add_custom_command(TARGET clocks POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/sound
+            $<TARGET_FILE_DIR:clocks>/sound
+)
+
 target_link_libraries(minibar
     PRIVATE
         PkgConfig::WAYLAND
         PkgConfig::CAIRO
         PkgConfig::PANGOCAIRO
+)
+
+target_link_libraries(screenfreeze
+    PRIVATE
+        PkgConfig::WAYLAND
 )
 
 install(TARGETS lock-menu
@@ -164,6 +198,22 @@ install(TARGETS idle-menu
     RUNTIME DESTINATION bin
 )
 
+install(TARGETS clocks
+    RUNTIME DESTINATION bin
+)
+
+install(FILES clocks.desktop
+    DESTINATION share/applications
+)
+
+install(DIRECTORY sound
+    DESTINATION share/clocks
+)
+
 install(TARGETS minibar
+    RUNTIME DESTINATION bin
+)
+
+install(TARGETS screenfreeze
     RUNTIME DESTINATION bin
 )

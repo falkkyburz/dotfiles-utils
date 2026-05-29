@@ -11,6 +11,8 @@
 #include <QUrl>
 #include <QtLogging>
 
+#include <cstdio>
+
 class ScreenshotActions final : public QObject {
     Q_OBJECT
 
@@ -19,7 +21,12 @@ public:
 
     Q_INVOKABLE void region()
     {
-        runShell(R"sh(sleep 0.18; geom="$(slurp)" || exit 0; grim -g "$geom" - | satty --filename -)sh");
+        runShell(regionCommand(true, false));
+    }
+
+    static bool runRegionWithoutGui(bool includeCursor)
+    {
+        return startDetachedCommand(regionCommand(false, includeCursor));
     }
 
     Q_INVOKABLE void focusedWindow()
@@ -41,6 +48,14 @@ public:
 private:
     QString m_focusedWindow;
 
+    static QString regionCommand(bool menuDelay, bool includeCursor)
+    {
+        return QStringLiteral("%1screenfreeze%2 & freeze_pid=$!; trap 'kill \"$freeze_pid\" 2>/dev/null' EXIT; sleep 0.15; geom=\"$(slurp)\" || exit 0; tmp=\"$(mktemp --suffix=.png)\" || exit 1; grim%3 -g \"$geom\" \"$tmp\" || exit 1; kill \"$freeze_pid\" 2>/dev/null; wait \"$freeze_pid\" 2>/dev/null; trap 'rm -f \"$tmp\"' EXIT; satty --filename \"$tmp\"")
+            .arg(menuDelay ? QStringLiteral("sleep 0.18; ") : QString{},
+                 includeCursor ? QStringLiteral(" --cursor") : QString{},
+                 includeCursor ? QStringLiteral(" -c") : QString{});
+    }
+
     static QString readFocusedWindow()
     {
         QProcess process;
@@ -54,12 +69,27 @@ private:
 
     static void runShell(const QString &command)
     {
-        if (!QProcess::startDetached("sh", {"-c", command})) {
+        if (!startDetachedCommand(command)) {
             qWarning().noquote() << "Failed to start screenshot command";
         }
         QGuiApplication::quit();
     }
+
+    static bool startDetachedCommand(const QString &command)
+    {
+        return QProcess::startDetached("sh", {"-c", command});
+    }
 };
+
+static void printUsage()
+{
+    std::fputs("Usage: screenshot-menu [--region]\n\n"
+               "Options:\n"
+               "  -r, --region  Capture a region without opening the GUI.\n"
+               "  -c, --cursor  Include the cursor when used with --region.\n"
+               "  -h, --help    Show this help text.\n",
+               stdout);
+}
 
 class EscapeFilter final : public QObject {
     Q_OBJECT
@@ -203,6 +233,37 @@ Window {
 
 int main(int argc, char *argv[])
 {
+    bool region = false;
+    bool includeCursor = false;
+
+    for (int i = 1; i < argc; ++i) {
+        const QString arg = QString::fromLocal8Bit(argv[i]);
+        if (arg == QStringLiteral("-h") || arg == QStringLiteral("--help")) {
+            printUsage();
+            return 0;
+        }
+        if (arg == QStringLiteral("-r") || arg == QStringLiteral("--region")) {
+            region = true;
+            continue;
+        }
+        if (arg == QStringLiteral("-c") || arg == QStringLiteral("--cursor")) {
+            includeCursor = true;
+            continue;
+        }
+
+        std::fprintf(stderr, "screenshot-menu: unknown option: %s\n", argv[i]);
+        return 2;
+    }
+
+    if (includeCursor && !region) {
+        std::fputs("screenshot-menu: --cursor requires --region\n", stderr);
+        return 2;
+    }
+
+    if (region) {
+        return ScreenshotActions::runRegionWithoutGui(includeCursor) ? 0 : 1;
+    }
+
     QGuiApplication app(argc, argv);
     QGuiApplication::setApplicationName("screenshot-menu");
     QGuiApplication::setDesktopFileName("screenshot-menu");

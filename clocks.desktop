@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Clocks
+GenericName=Clock
+Comment=World clocks, alarms, stopwatch, and timer
+Exec=clocks
+Icon=preferences-system-time
+Terminal=false
+Categories=Utility;Clock;
+Keywords=time;clock;alarm;stopwatch;timer;
+StartupNotify=true

@@ -92,11 +92,14 @@ add_executable(minibar minibar.cpp ${WLR_CODE} ${XDG_CODE})
 add_dependencies(minibar minibar_protocol_bindings)
 add_executable(screenfreeze screenfreeze.cpp ${WLR_CODE} ${XDG_CODE})
 add_dependencies(screenfreeze minibar_protocol_bindings)
+add_executable(battery-daemon battery.cpp)
 set_source_files_properties(${WLR_CODE} ${XDG_CODE} PROPERTIES LANGUAGE C)
 set_target_properties(minibar PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 set_target_properties(screenfreeze PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+set_target_properties(battery-daemon PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 target_compile_options(minibar PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_options(screenfreeze PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(battery-daemon PRIVATE -Wall -Wextra -Wpedantic)
 target_include_directories(minibar PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(screenfreeze PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
@@ -215,5 +218,9 @@ install(TARGETS minibar
 )
 
 install(TARGETS screenfreeze
+    RUNTIME DESTINATION bin
+)
+
+install(TARGETS battery-daemon
     RUNTIME DESTINATION bin
 )

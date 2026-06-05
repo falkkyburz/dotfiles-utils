@@ -340,7 +340,9 @@ void handle_status_change(const Config& config, State& state, const BatteryReadi
         state.warn_sent = false;
         state.critical_sent = false;
         state.suspend_sent = false;
-        run_command(config, "charging command", render_command(config.charging_command, battery));
+        if (battery.percent < 97) {
+            run_command(config, "charging command", render_command(config.charging_command, battery));
+        }
     } else if (battery.status == "Discharging") {
         run_command(config, "discharging command", render_command(config.discharging_command, battery));
     } else if (battery.status == "Full") {

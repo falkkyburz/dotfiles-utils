@@ -1,11 +1,32 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(qt-lock-menu VERSION 0.1.0 LANGUAGES C CXX)
+project(dotfiles-utils VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+    set(CMAKE_INSTALL_PREFIX "$ENV{HOME}/.local" CACHE PATH "Install prefix" FORCE)
+endif()
+
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    get_filename_component(BUILD_DIR_NAME "${CMAKE_BINARY_DIR}" NAME)
+    string(TOLOWER "${BUILD_DIR_NAME}" BUILD_DIR_NAME_LOWER)
+    if(BUILD_DIR_NAME_LOWER MATCHES "release")
+        set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    else()
+        set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+    endif()
+endif()
+
+string(TOLOWER "${CMAKE_BUILD_TYPE}" BUILD_TYPE_LOWER)
+if(BUILD_TYPE_LOWER STREQUAL "debug")
+    set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "Export compile commands for clangd" FORCE)
+else()
+    set(CMAKE_EXPORT_COMPILE_COMMANDS OFF CACHE BOOL "Export compile commands for clangd" FORCE)
+    file(REMOVE "${CMAKE_BINARY_DIR}/compile_commands.json")
+endif()
 
 if(CMAKE_EXPORT_COMPILE_COMMANDS)
     add_custom_target(
@@ -13,18 +34,18 @@ if(CMAKE_EXPORT_COMPILE_COMMANDS)
         COMMAND ${CMAKE_COMMAND} -E create_symlink
                 ${CMAKE_BINARY_DIR}/compile_commands.json
                 ${CMAKE_SOURCE_DIR}/compile_commands.json
-        COMMENT "Creating compile_commands.json symlink for clangd"
+        COMMENT "Creating debug compile_commands.json symlink for clangd"
     )
 endif()
 
-find_package(Qt6 REQUIRED COMPONENTS Core DBus Gui Qml Quick QuickControls2)
 find_package(PkgConfig REQUIRED)
 find_program(WAYLAND_SCANNER wayland-scanner REQUIRED)
+pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
+pkg_check_modules(GLESV2 REQUIRED IMPORTED_TARGET glesv2)
+pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
 pkg_check_modules(WAYLAND REQUIRED IMPORTED_TARGET wayland-client)
 pkg_check_modules(CAIRO REQUIRED IMPORTED_TARGET cairo)
 pkg_check_modules(PANGOCAIRO REQUIRED IMPORTED_TARGET pangocairo)
-
-qt_standard_project_setup()
 
 set(WLR_PROTO "/usr/share/wlr-protocols/unstable/wlr-layer-shell-unstable-v1.xml" CACHE FILEPATH "wlr layer shell protocol XML")
 set(XDG_PROTO "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml" CACHE FILEPATH "xdg shell protocol XML")
@@ -64,103 +85,45 @@ add_custom_command(
 
 add_custom_target(minibar_protocol_bindings DEPENDS ${WLR_HEADER} ${WLR_CODE} ${XDG_HEADER} ${XDG_CODE})
 
-qt_add_executable(lock-menu
-    lock-menu.cpp
+add_library(imgui_app STATIC
+    imgui_app.cpp
+    third_party/imgui/imgui.cpp
+    third_party/imgui/imgui_draw.cpp
+    third_party/imgui/imgui_tables.cpp
+    third_party/imgui/imgui_widgets.cpp
+    third_party/imgui/backends/imgui_impl_opengl3.cpp
+    third_party/imgui/backends/imgui_impl_sdl2.cpp
 )
 
-qt_add_executable(power-menu
-    power-menu.cpp
+target_include_directories(imgui_app
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        third_party/imgui
+        third_party/imgui/backends
 )
 
-qt_add_executable(screenshot-menu
-    screenshot-menu.cpp
+target_link_libraries(imgui_app
+    PUBLIC
+        PkgConfig::SDL2
+        PkgConfig::EGL
+        PkgConfig::GLESV2
 )
 
-qt_add_executable(screenrecord-menu
-    screenrecord-menu.cpp
-)
+function(add_imgui_executable target source)
+    add_executable(${target} ${source})
+    target_link_libraries(${target} PRIVATE imgui_app)
+endfunction()
 
-qt_add_executable(idle-menu
-    idle-menu.cpp
-)
-
-qt_add_executable(clocks
-    clocks.cpp
-)
-
-add_executable(minibar minibar.cpp ${WLR_CODE} ${XDG_CODE})
-add_dependencies(minibar minibar_protocol_bindings)
-add_executable(screenfreeze screenfreeze.cpp ${WLR_CODE} ${XDG_CODE})
-add_dependencies(screenfreeze minibar_protocol_bindings)
-add_executable(battery-daemon battery.cpp)
-set_source_files_properties(${WLR_CODE} ${XDG_CODE} PROPERTIES LANGUAGE C)
-set_target_properties(minibar PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
-set_target_properties(screenfreeze PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
-set_target_properties(battery-daemon PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
-target_compile_options(minibar PRIVATE -Wall -Wextra -Wpedantic)
-target_compile_options(screenfreeze PRIVATE -Wall -Wextra -Wpedantic)
-target_compile_options(battery-daemon PRIVATE -Wall -Wextra -Wpedantic)
-target_include_directories(minibar PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-target_include_directories(screenfreeze PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-
-target_link_libraries(lock-menu
-    PRIVATE
-        Qt6::Core
-        Qt6::Gui
-        Qt6::Qml
-        Qt6::Quick
-        Qt6::QuickControls2
-)
-
-target_link_libraries(power-menu
-    PRIVATE
-        Qt6::Core
-        Qt6::DBus
-        Qt6::Gui
-        Qt6::Qml
-        Qt6::Quick
-        Qt6::QuickControls2
-)
-
-target_link_libraries(screenshot-menu
-    PRIVATE
-        Qt6::Core
-        Qt6::Gui
-        Qt6::Qml
-        Qt6::Quick
-        Qt6::QuickControls2
-)
-
-target_link_libraries(screenrecord-menu
-    PRIVATE
-        Qt6::Core
-        Qt6::Gui
-        Qt6::Qml
-        Qt6::Quick
-        Qt6::QuickControls2
-)
-
-target_link_libraries(idle-menu
-    PRIVATE
-        Qt6::Core
-        Qt6::Gui
-        Qt6::Qml
-        Qt6::Quick
-        Qt6::QuickControls2
-)
+add_imgui_executable(lock-menu lock-menu.cpp)
+add_imgui_executable(power-menu power-menu.cpp)
+add_imgui_executable(screenshot-menu screenshot-menu.cpp)
+add_imgui_executable(screenrecord-menu screenrecord-menu.cpp)
+add_imgui_executable(idle-menu idle-menu.cpp)
+add_imgui_executable(clocks clocks.cpp)
 
 target_compile_definitions(clocks
     PRIVATE
         CLOCKS_SOUND_DIR="${CMAKE_CURRENT_SOURCE_DIR}/sound"
-)
-
-target_link_libraries(clocks
-    PRIVATE
-        Qt6::Core
-        Qt6::Gui
-        Qt6::Qml
-        Qt6::Quick
-        Qt6::QuickControls2
 )
 
 add_custom_command(TARGET clocks POST_BUILD
@@ -168,6 +131,19 @@ add_custom_command(TARGET clocks POST_BUILD
             ${CMAKE_CURRENT_SOURCE_DIR}/sound
             $<TARGET_FILE_DIR:clocks>/sound
 )
+
+add_executable(minibar minibar.cpp ${WLR_CODE} ${XDG_CODE})
+add_dependencies(minibar minibar_protocol_bindings)
+add_executable(screenfreeze screenfreeze.cpp ${WLR_CODE} ${XDG_CODE})
+add_dependencies(screenfreeze minibar_protocol_bindings)
+add_executable(battery-daemon battery.cpp)
+
+set_source_files_properties(${WLR_CODE} ${XDG_CODE} PROPERTIES LANGUAGE C)
+target_compile_options(minibar PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(screenfreeze PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(battery-daemon PRIVATE -Wall -Wextra -Wpedantic)
+target_include_directories(minibar PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+target_include_directories(screenfreeze PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 target_link_libraries(minibar
     PRIVATE
@@ -181,27 +157,7 @@ target_link_libraries(screenfreeze
         PkgConfig::WAYLAND
 )
 
-install(TARGETS lock-menu
-    RUNTIME DESTINATION bin
-)
-
-install(TARGETS power-menu
-    RUNTIME DESTINATION bin
-)
-
-install(TARGETS screenshot-menu
-    RUNTIME DESTINATION bin
-)
-
-install(TARGETS screenrecord-menu
-    RUNTIME DESTINATION bin
-)
-
-install(TARGETS idle-menu
-    RUNTIME DESTINATION bin
-)
-
-install(TARGETS clocks
+install(TARGETS lock-menu power-menu screenshot-menu screenrecord-menu idle-menu clocks minibar screenfreeze battery-daemon
     RUNTIME DESTINATION bin
 )
 
@@ -211,16 +167,4 @@ install(FILES clocks.desktop
 
 install(DIRECTORY sound
     DESTINATION share/clocks
-)
-
-install(TARGETS minibar
-    RUNTIME DESTINATION bin
-)
-
-install(TARGETS screenfreeze
-    RUNTIME DESTINATION bin
-)
-
-install(TARGETS battery-daemon
-    RUNTIME DESTINATION bin
 )

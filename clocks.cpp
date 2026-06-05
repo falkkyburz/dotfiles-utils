@@ -1,1395 +1,959 @@
-#include <QCoreApplication>
-#include <QDateTime>
-#include <QDir>
-#include <QEvent>
-#include <QFileInfo>
-#include <QGuiApplication>
-#include <QKeyEvent>
-#include <QLocale>
-#include <QObject>
-#include <QProcess>
-#include <QQmlApplicationEngine>
-#include <QQmlContext>
-#include <QQuickStyle>
-#include <QStandardPaths>
-#include <QStringList>
-#include <QTimeZone>
-#include <QTimer>
-#include <QUrl>
-#include <QtLogging>
+#include "imgui_app.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cctype>
+#include <cmath>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <filesystem>
+#include <iostream>
+#include <optional>
+#include <set>
+#include <string>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <vector>
 
-class ClockBackend final : public QObject {
-    Q_OBJECT
-    Q_PROPERTY(QStringList zones READ zones CONSTANT)
+namespace {
 
+using Clock = std::chrono::steady_clock;
+
+constexpr int windowWidth = 900;
+constexpr int windowHeight = 640;
+
+struct TimeValue {
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+};
+
+struct Alarm {
+    int hour = 0;
+    int minute = 0;
+    std::string label;
+    bool enabled = false;
+    std::string lastKey;
+};
+
+struct Lap {
+    int number = 0;
+    std::string elapsed;
+};
+
+std::string lower(std::string text)
+{
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return text;
+}
+
+bool containsInsensitive(const std::string &text, const std::string &needle)
+{
+    if (needle.empty()) {
+        return true;
+    }
+    return lower(text).find(lower(needle)) != std::string::npos;
+}
+
+std::string twoDigits(int value)
+{
+    char buffer[8];
+    std::snprintf(buffer, sizeof(buffer), "%02d", value);
+    return buffer;
+}
+
+std::string alarmText(int hour, int minute)
+{
+    return twoDigits(hour) + ":" + twoDigits(minute);
+}
+
+std::string formatDuration(int seconds)
+{
+    seconds = std::max(0, seconds);
+    const int hours = seconds / 3600;
+    const int minutes = (seconds % 3600) / 60;
+    const int secs = seconds % 60;
+    return twoDigits(hours) + ":" + twoDigits(minutes) + ":" + twoDigits(secs);
+}
+
+std::string formatMs(long long ms)
+{
+    ms = std::max(0LL, ms);
+    const long long centis = (ms % 1000) / 10;
+    const long long totalSeconds = ms / 1000;
+    const long long seconds = totalSeconds % 60;
+    const long long minutes = (totalSeconds / 60) % 60;
+    const long long hours = totalSeconds / 3600;
+
+    if (hours > 0) {
+        return twoDigits(static_cast<int>(hours)) + ":" + twoDigits(static_cast<int>(minutes)) + ":" +
+               twoDigits(static_cast<int>(seconds)) + "." + twoDigits(static_cast<int>(centis));
+    }
+    return twoDigits(static_cast<int>(minutes)) + ":" + twoDigits(static_cast<int>(seconds)) + "." +
+           twoDigits(static_cast<int>(centis));
+}
+
+std::string formatWithStrftime(std::time_t timestamp, const char *format)
+{
+    std::tm tm{};
+    localtime_r(&timestamp, &tm);
+    char buffer[128];
+    if (std::strftime(buffer, sizeof(buffer), format, &tm) == 0) {
+        return {};
+    }
+    return buffer;
+}
+
+class ScopedTimeZone {
 public:
-    explicit ClockBackend(QObject *parent = nullptr) : QObject(parent), m_zones(loadZones())
+    explicit ScopedTimeZone(const std::string &zone)
     {
-        connect(&m_player, &QProcess::finished, this, [this] {
-            if (m_loop && !m_currentFile.isEmpty()) {
-                QTimer::singleShot(300, this, &ClockBackend::startCurrentSound);
+        const char *old = std::getenv("TZ");
+        if (old != nullptr) {
+            m_old = old;
+        }
+        setenv("TZ", zone.c_str(), 1);
+        tzset();
+    }
+
+    ~ScopedTimeZone()
+    {
+        if (m_old.has_value()) {
+            setenv("TZ", m_old->c_str(), 1);
+        } else {
+            unsetenv("TZ");
+        }
+        tzset();
+    }
+
+private:
+    std::optional<std::string> m_old;
+};
+
+std::string formatInZone(const std::string &zone, const char *format)
+{
+    ScopedTimeZone scoped(zone);
+    return formatWithStrftime(std::time(nullptr), format);
+}
+
+std::string zoneTitle(std::string zoneId)
+{
+    const auto slash = zoneId.find_last_of('/');
+    if (slash != std::string::npos) {
+        zoneId = zoneId.substr(slash + 1);
+    }
+    std::replace(zoneId.begin(), zoneId.end(), '_', ' ');
+    return zoneId.empty() ? "UTC" : zoneId;
+}
+
+std::string offsetForZone(const std::string &zone)
+{
+    ScopedTimeZone scoped(zone);
+    const std::time_t now = std::time(nullptr);
+    std::tm tm{};
+    localtime_r(&now, &tm);
+    const long offsetSeconds = tm.tm_gmtoff;
+    const long totalMinutes = std::labs(offsetSeconds) / 60;
+    const long hours = totalMinutes / 60;
+    const long minutes = totalMinutes % 60;
+
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "UTC%c%02ld:%02ld", offsetSeconds >= 0 ? '+' : '-', hours, minutes);
+    return buffer;
+}
+
+std::string systemTimeZone()
+{
+    std::error_code error;
+    const auto link = std::filesystem::read_symlink("/etc/localtime", error);
+    if (!error) {
+        const std::string path = link.string();
+        const std::string marker = "/zoneinfo/";
+        const auto pos = path.find(marker);
+        if (pos != std::string::npos) {
+            return path.substr(pos + marker.size());
+        }
+    }
+
+    const std::string timedate = ui::readCommandOutput("timedatectl show -p Timezone --value 2>/dev/null");
+    return timedate.empty() ? "UTC" : timedate;
+}
+
+bool zoneFileAllowed(const std::filesystem::path &relative)
+{
+    if (relative.empty()) {
+        return false;
+    }
+    const std::string path = relative.generic_string();
+    if (path.rfind("posix/", 0) == 0 || path.rfind("right/", 0) == 0) {
+        return false;
+    }
+
+    const std::string filename = relative.filename().string();
+    return filename != "zone.tab" && filename != "zone1970.tab" && filename != "iso3166.tab" && filename != "leapseconds" &&
+           filename != "tzdata.zi" && filename != "posixrules" && filename != "localtime";
+}
+
+std::vector<std::string> loadZones()
+{
+    std::set<std::string> zones;
+    const std::filesystem::path root = "/usr/share/zoneinfo";
+    std::error_code error;
+    if (std::filesystem::exists(root, error)) {
+        for (const auto &entry : std::filesystem::recursive_directory_iterator(root, std::filesystem::directory_options::skip_permission_denied, error)) {
+            if (error) {
+                error.clear();
+                continue;
             }
-        });
-    }
-
-    ~ClockBackend() override { stopSound(); }
-
-    QStringList zones() const { return m_zones; }
-
-    Q_INVOKABLE QString systemTimeZone() const
-    {
-        const QString zone = QString::fromUtf8(QTimeZone::systemTimeZoneId());
-        return zone.isEmpty() ? QStringLiteral("UTC") : zone;
-    }
-
-    Q_INVOKABLE QString localTime() const
-    {
-        return QLocale().toString(QDateTime::currentDateTime(), QStringLiteral("HH:mm"));
-    }
-
-    Q_INVOKABLE QString localDate() const
-    {
-        return QLocale().toString(QDateTime::currentDateTime(), QStringLiteral("dddd, MMMM d"));
-    }
-
-    Q_INVOKABLE QString zoneTitle(const QString &zoneId) const
-    {
-        if (zoneId == QStringLiteral("UTC")) {
-            return zoneId;
+            if (!entry.is_regular_file(error)) {
+                continue;
+            }
+            const auto relative = std::filesystem::relative(entry.path(), root, error);
+            if (!error && zoneFileAllowed(relative)) {
+                zones.insert(relative.generic_string());
+            }
         }
+    }
+    zones.insert("UTC");
 
-        QString title = zoneId.section('/', -1);
-        if (title.isEmpty()) {
-            title = zoneId;
-        }
-        title.replace('_', ' ');
-        return title;
+    std::vector<std::string> result(zones.begin(), zones.end());
+    std::sort(result.begin(), result.end(), [](const std::string &left, const std::string &right) {
+        return lower(left) < lower(right);
+    });
+    return result;
+}
+
+std::string remainingAlarmText(int hour, int minute)
+{
+    const std::time_t nowTime = std::time(nullptr);
+    std::tm now{};
+    localtime_r(&nowTime, &now);
+
+    std::tm alarm = now;
+    alarm.tm_hour = hour;
+    alarm.tm_min = minute;
+    alarm.tm_sec = 0;
+    std::time_t alarmTime = std::mktime(&alarm);
+    if (alarmTime <= nowTime) {
+        alarm.tm_mday += 1;
+        alarmTime = std::mktime(&alarm);
     }
 
-    Q_INVOKABLE QString timeForZone(const QString &zoneId) const
-    {
-        const QTimeZone zone(zoneId.toUtf8());
-        if (!zone.isValid()) {
-            return QStringLiteral("--:--");
+    const int totalMinutes = std::max(1, static_cast<int>(std::ceil(std::difftime(alarmTime, nowTime) / 60.0)));
+    const int hours = totalMinutes / 60;
+    const int minutes = totalMinutes % 60;
+    std::string text = "In ";
+    if (hours > 0) {
+        text += std::to_string(hours) + (hours == 1 ? " hour" : " hours");
+        if (minutes > 0) {
+            text += " ";
         }
+    }
+    if (minutes > 0 || hours == 0) {
+        text += std::to_string(minutes) + (minutes == 1 ? " minute" : " minutes");
+    }
+    return text;
+}
 
-        return QLocale().toString(QDateTime::currentDateTimeUtc().toTimeZone(zone), QStringLiteral("HH:mm"));
+std::string alarmKeyForNow(std::tm now)
+{
+    return std::to_string(now.tm_year + 1900) + "-" + std::to_string(now.tm_mon) + "-" + std::to_string(now.tm_mday) + "-" +
+           std::to_string(now.tm_hour) + "-" + std::to_string(now.tm_min);
+}
+
+bool parseTimeText(const char *text, bool showSeconds, int maxHour, TimeValue &value)
+{
+    std::string digits;
+    for (const char *cursor = text; *cursor != '\0'; ++cursor) {
+        if (std::isdigit(static_cast<unsigned char>(*cursor))) {
+            digits += *cursor;
+        }
     }
 
-    Q_INVOKABLE QString dateForZone(const QString &zoneId) const
-    {
-        const QTimeZone zone(zoneId.toUtf8());
-        if (!zone.isValid()) {
-            return QStringLiteral("Unknown zone");
-        }
+    const size_t wanted = showSeconds ? 6 : 4;
+    while (digits.size() < wanted) {
+        digits += '0';
+    }
+    digits.resize(wanted);
 
-        return QLocale().toString(QDateTime::currentDateTimeUtc().toTimeZone(zone), QStringLiteral("ddd, MMM d"));
+    const int hour = std::stoi(digits.substr(0, 2));
+    const int minute = std::stoi(digits.substr(2, 2));
+    const int second = showSeconds ? std::stoi(digits.substr(4, 2)) : 0;
+    if (hour < 0 || hour > maxHour || minute < 0 || minute > 59 || second < 0 || second > 59) {
+        return false;
     }
 
-    Q_INVOKABLE QString offsetForZone(const QString &zoneId) const
-    {
-        const QTimeZone zone(zoneId.toUtf8());
-        if (!zone.isValid()) {
-            return QStringLiteral("UTC");
-        }
+    value = {hour, minute, second};
+    return true;
+}
 
-        const int offsetSeconds = zone.offsetFromUtc(QDateTime::currentDateTimeUtc());
-        const int totalMinutes = std::abs(offsetSeconds) / 60;
-        const int hours = totalMinutes / 60;
-        const int minutes = totalMinutes % 60;
-        return QStringLiteral("UTC%1%2:%3")
-            .arg(offsetSeconds >= 0 ? QStringLiteral("+") : QStringLiteral("-"))
-            .arg(hours, 2, 10, QLatin1Char('0'))
-            .arg(minutes, 2, 10, QLatin1Char('0'));
+void setTimeText(char *buffer, size_t size, TimeValue value, bool showSeconds)
+{
+    if (showSeconds) {
+        std::snprintf(buffer, size, "%02d:%02d:%02d", value.hour, value.minute, value.second);
+    } else {
+        std::snprintf(buffer, size, "%02d:%02d", value.hour, value.minute);
     }
+}
 
-    Q_INVOKABLE bool playAlarm() { return playTone(QStringLiteral("alarm.wav"), true); }
-    Q_INVOKABLE bool playTimer() { return playTone(QStringLiteral("timer.wav"), true); }
-    Q_INVOKABLE bool previewAlarm() { return playTone(QStringLiteral("alarm.wav"), false); }
-    Q_INVOKABLE bool previewTimer() { return playTone(QStringLiteral("timer.wav"), false); }
+void centerText(const std::string &text, float scale, ImVec4 color)
+{
+    ImGui::SetWindowFontScale(scale);
+    const float width = ImGui::CalcTextSize(text.c_str()).x;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (ImGui::GetContentRegionAvail().x - width) * 0.5f));
+    ImGui::TextColored(color, "%s", text.c_str());
+    ImGui::SetWindowFontScale(1.0f);
+}
 
-    Q_INVOKABLE void stopSound()
+bool centeredAccentButton(const char *label, float width, ImVec4 color)
+{
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (ImGui::GetContentRegionAvail().x - width) * 0.5f));
+    return ui::accentButton(label, ImVec2(width, 46.0f), color);
+}
+
+class AudioPlayer {
+public:
+    ~AudioPlayer() { stop(); }
+
+    bool playAlarm() { return playTone("alarm.wav", true); }
+    bool playTimer() { return playTone("timer.wav", true); }
+    bool previewAlarm() { return playTone("alarm.wav", false); }
+    bool previewTimer() { return playTone("timer.wav", false); }
+
+    void stop()
     {
         m_loop = false;
         m_currentFile.clear();
-        if (m_player.state() != QProcess::NotRunning) {
-            m_player.kill();
-            m_player.waitForFinished(250);
+        stopProcess();
+    }
+
+    void update()
+    {
+        if (m_pid <= 0) {
+            return;
+        }
+
+        int status = 0;
+        const pid_t result = waitpid(m_pid, &status, WNOHANG);
+        if (result == 0) {
+            return;
+        }
+
+        m_pid = -1;
+        if (m_loop && !m_currentFile.empty()) {
+            m_restartAt = Clock::now() + std::chrono::milliseconds(300);
+        }
+    }
+
+    void maybeRestart()
+    {
+        if (m_pid <= 0 && m_loop && !m_currentFile.empty() && Clock::now() >= m_restartAt) {
+            startCurrentSound();
         }
     }
 
 private:
-    QStringList m_zones;
-    QProcess m_player;
-    QString m_currentFile;
+    pid_t m_pid = -1;
+    std::string m_currentFile;
     bool m_loop = false;
+    Clock::time_point m_restartAt = Clock::now();
 
-    static QStringList loadZones()
+    std::string resolveSound(const std::string &fileName) const
     {
-        QStringList zones;
-        zones.reserve(QTimeZone::availableTimeZoneIds().size());
-        for (const QByteArray &id : QTimeZone::availableTimeZoneIds()) {
-            const QString zone = QString::fromUtf8(id);
-            if (!zone.startsWith(QStringLiteral("posix/")) && !zone.startsWith(QStringLiteral("right/"))) {
-                zones.push_back(zone);
-            }
-        }
-
-        zones.removeDuplicates();
-        zones.sort(Qt::CaseInsensitive);
-        if (!zones.contains(QStringLiteral("UTC"))) {
-            zones.prepend(QStringLiteral("UTC"));
-        }
-        return zones;
-    }
-
-    QString resolveSound(const QString &fileName) const
-    {
-        const QString appDir = QCoreApplication::applicationDirPath();
-        const QStringList dirs = {
-            QDir(appDir).filePath(QStringLiteral("sound")),
-            QDir(appDir).filePath(QStringLiteral("../share/clocks/sound")),
+        const std::filesystem::path appDir = ui::executableDir();
+        const std::vector<std::filesystem::path> dirs = {
+            appDir / "sound",
+            appDir / "../share/clocks/sound",
 #ifdef CLOCKS_SOUND_DIR
-            QString::fromUtf8(CLOCKS_SOUND_DIR),
+            CLOCKS_SOUND_DIR,
 #endif
         };
 
-        for (const QString &dir : dirs) {
-            const QString path = QDir::cleanPath(QDir(dir).filePath(fileName));
-            if (QFileInfo::exists(path)) {
-                return path;
+        for (const auto &dir : dirs) {
+            const auto path = std::filesystem::weakly_canonical(dir / fileName);
+            std::error_code error;
+            if (std::filesystem::exists(path, error)) {
+                return path.string();
             }
         }
-
         return {};
     }
 
-    bool playTone(const QString &fileName, bool loop)
+    bool playTone(const std::string &fileName, bool loop)
     {
-        const QString file = resolveSound(fileName);
-        if (file.isEmpty()) {
-            qWarning().noquote() << "Missing sound file" << fileName;
+        const std::string file = resolveSound(fileName);
+        if (file.empty()) {
+            std::cerr << "clocks: missing sound file " << fileName << '\n';
             return false;
         }
 
+        stopProcess();
         m_loop = loop;
         m_currentFile = file;
         startCurrentSound();
         return true;
     }
 
+    void stopProcess()
+    {
+        if (m_pid > 0) {
+            kill(m_pid, SIGTERM);
+            waitpid(m_pid, nullptr, 0);
+            m_pid = -1;
+        }
+    }
+
     void startCurrentSound()
     {
-        if (m_currentFile.isEmpty()) {
+        if (m_currentFile.empty()) {
             return;
         }
 
-        if (m_player.state() != QProcess::NotRunning) {
-            m_player.kill();
-            m_player.waitForFinished(250);
-        }
+        stopProcess();
 
-        const QStringList playerNames = {
-            QStringLiteral("pw-play"),
-            QStringLiteral("paplay"),
-            QStringLiteral("aplay"),
-            QStringLiteral("ffplay"),
-            QStringLiteral("mpv"),
-        };
-
-        QString program;
-        QString playerName;
-        for (const QString &candidate : playerNames) {
-            program = QStandardPaths::findExecutable(candidate);
-            if (!program.isEmpty()) {
-                playerName = candidate;
+        const std::vector<std::string> playerNames = {"pw-play", "paplay", "aplay", "ffplay", "mpv"};
+        std::string player;
+        std::string program;
+        for (const std::string &candidate : playerNames) {
+            program = ui::findExecutable({candidate});
+            if (!program.empty()) {
+                player = candidate;
                 break;
             }
         }
 
-        if (program.isEmpty()) {
-            qWarning().noquote() << "No audio player found. Install pw-play, paplay, aplay, ffplay, or mpv.";
+        if (program.empty()) {
+            std::fputs("clocks: no audio player found. Install pw-play, paplay, aplay, ffplay, or mpv.\n", stderr);
             return;
         }
 
-        QStringList args;
-        if (playerName == QStringLiteral("ffplay")) {
-            args << QStringLiteral("-nodisp") << QStringLiteral("-autoexit") << QStringLiteral("-loglevel")
-                 << QStringLiteral("quiet") << m_currentFile;
-        } else if (playerName == QStringLiteral("mpv")) {
-            args << QStringLiteral("--no-terminal") << QStringLiteral("--really-quiet") << m_currentFile;
+        std::vector<std::string> args;
+        if (player == "ffplay") {
+            args = {"-nodisp", "-autoexit", "-loglevel", "quiet", m_currentFile};
+        } else if (player == "mpv") {
+            args = {"--no-terminal", "--really-quiet", m_currentFile};
         } else {
-            args << m_currentFile;
+            args = {m_currentFile};
         }
 
-        m_player.start(program, args);
-        if (!m_player.waitForStarted(700)) {
-            qWarning().noquote() << "Failed to start audio player" << playerName;
+        const pid_t pid = fork();
+        if (pid < 0) {
+            std::cerr << "clocks: fork failed: " << std::strerror(errno) << '\n';
+            return;
         }
+        if (pid == 0) {
+            std::vector<char *> argv;
+            argv.reserve(args.size() + 2);
+            argv.push_back(const_cast<char *>(program.c_str()));
+            for (std::string &arg : args) {
+                argv.push_back(arg.data());
+            }
+            argv.push_back(nullptr);
+            execv(program.c_str(), argv.data());
+            _exit(127);
+        }
+
+        m_pid = pid;
     }
 };
 
-class EscapeFilter final : public QObject {
-    Q_OBJECT
+struct ClockState {
+    std::vector<std::string> zones = loadZones();
+    std::vector<std::string> worldZones;
+    std::vector<Alarm> alarms;
+    std::vector<Lap> laps;
+    AudioPlayer audio;
 
-public:
-    using QObject::QObject;
+    int page = 0;
+    int selectedZone = 0;
+    char zoneFilter[128] = "";
+    char alarmLabel[128] = "";
+    char alarmTimeText[16] = "07:30";
+    char timerTimeText[16] = "00:05:00";
+    TimeValue alarmTime = {7, 30, 0};
+    TimeValue timerTime = {0, 5, 0};
 
-protected:
-    bool eventFilter(QObject *object, QEvent *event) override
+    bool stopwatchRunning = false;
+    Clock::time_point stopwatchStartedAt = Clock::now();
+    long long stopwatchBaseMs = 0;
+
+    bool timerRunning = false;
+    int timerTotalSeconds = 0;
+    int timerRemainingSeconds = 0;
+    Clock::time_point timerTarget = Clock::now();
+
+    bool ringing = false;
+    std::string ringingTitle = "Alarm";
+    std::string ringingMessage;
+    std::time_t lastAlarmCheck = 0;
+
+    ClockState()
     {
-        const auto type = event->type();
-        if (type == QEvent::ShortcutOverride || type == QEvent::KeyPress || type == QEvent::KeyRelease) {
-            const auto *keyEvent = static_cast<QKeyEvent *>(event);
-            if (keyEvent->key() == Qt::Key_Escape) {
-                QGuiApplication::quit();
-                return true;
+        const std::string systemZone = systemTimeZone();
+        addWorldClock(systemZone);
+        addWorldClock("UTC");
+        addWorldClock("America/New_York");
+        addWorldClock("Europe/London");
+        addWorldClock("Asia/Tokyo");
+        alarms.push_back({7, 30, "Morning", false, {}});
+
+        const auto found = std::find(zones.begin(), zones.end(), systemZone);
+        if (found != zones.end()) {
+            selectedZone = static_cast<int>(std::distance(zones.begin(), found));
+        }
+    }
+
+    void addWorldClock(const std::string &zone)
+    {
+        if (!zone.empty() && std::find(worldZones.begin(), worldZones.end(), zone) == worldZones.end()) {
+            worldZones.push_back(zone);
+        }
+    }
+
+    long long stopwatchElapsedMs() const
+    {
+        if (!stopwatchRunning) {
+            return stopwatchBaseMs;
+        }
+        return stopwatchBaseMs + std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - stopwatchStartedAt).count();
+    }
+
+    void startStopwatch()
+    {
+        stopwatchStartedAt = Clock::now();
+        stopwatchRunning = true;
+    }
+
+    void pauseStopwatch()
+    {
+        stopwatchBaseMs = stopwatchElapsedMs();
+        stopwatchRunning = false;
+    }
+
+    void resetStopwatch()
+    {
+        stopwatchRunning = false;
+        stopwatchBaseMs = 0;
+        laps.clear();
+    }
+
+    void addLap()
+    {
+        laps.insert(laps.begin(), {static_cast<int>(laps.size()) + 1, formatMs(stopwatchElapsedMs())});
+    }
+
+    void setTimerPreset(int minutes)
+    {
+        timerTime = {0, minutes, 0};
+        setTimeText(timerTimeText, sizeof(timerTimeText), timerTime, true);
+    }
+
+    void startTimer()
+    {
+        if (!parseTimeText(timerTimeText, true, 99, timerTime)) {
+            setTimeText(timerTimeText, sizeof(timerTimeText), timerTime, true);
+            return;
+        }
+        const int total = timerTime.hour * 3600 + timerTime.minute * 60 + timerTime.second;
+        if (total <= 0) {
+            return;
+        }
+        timerTotalSeconds = total;
+        timerRemainingSeconds = total;
+        timerTarget = Clock::now() + std::chrono::seconds(total);
+        timerRunning = true;
+    }
+
+    void pauseTimer()
+    {
+        timerRemainingSeconds = std::max(0, static_cast<int>(std::ceil(std::chrono::duration<double>(timerTarget - Clock::now()).count())));
+        timerRunning = false;
+    }
+
+    void resumeTimer()
+    {
+        if (timerRemainingSeconds <= 0) {
+            return;
+        }
+        timerTarget = Clock::now() + std::chrono::seconds(timerRemainingSeconds);
+        timerRunning = true;
+    }
+
+    void resetTimer()
+    {
+        timerRunning = false;
+        timerTotalSeconds = 0;
+        timerRemainingSeconds = 0;
+    }
+
+    void showRinging(std::string title, std::string message, bool alarm)
+    {
+        ringingTitle = std::move(title);
+        ringingMessage = std::move(message);
+        ringing = true;
+        if (alarm) {
+            audio.playAlarm();
+        } else {
+            audio.playTimer();
+        }
+    }
+
+    void updateTimer()
+    {
+        if (!timerRunning) {
+            return;
+        }
+        timerRemainingSeconds = std::max(0, static_cast<int>(std::ceil(std::chrono::duration<double>(timerTarget - Clock::now()).count())));
+        if (timerRemainingSeconds <= 0) {
+            timerRunning = false;
+            showRinging("Timer", "Countdown complete", false);
+        }
+    }
+
+    void checkAlarms()
+    {
+        const std::time_t nowTime = std::time(nullptr);
+        if (nowTime == lastAlarmCheck) {
+            return;
+        }
+        lastAlarmCheck = nowTime;
+
+        std::tm now{};
+        localtime_r(&nowTime, &now);
+        const std::string key = alarmKeyForNow(now);
+        for (Alarm &alarm : alarms) {
+            if (alarm.enabled && alarm.hour == now.tm_hour && alarm.minute == now.tm_min && alarm.lastKey != key) {
+                alarm.lastKey = key;
+                showRinging("Alarm", alarm.label + " at " + alarmText(alarm.hour, alarm.minute), true);
             }
         }
+    }
 
-        return QObject::eventFilter(object, event);
+    void update()
+    {
+        checkAlarms();
+        updateTimer();
+        audio.update();
+        audio.maybeRestart();
     }
 };
 
-static constexpr auto qml = R"qml(
-import QtQuick
-import QtQuick.Controls
-import QtQuick.Layouts
-
-Window {
-    id: root
-    width: 900
-    height: 640
-    minimumWidth: 520
-    minimumHeight: 540
-    visible: true
-    title: "Clocks"
-    color: bg
-
-    readonly property color bg: "#181825"
-    readonly property color panel: "#1e1e2e"
-    readonly property color card: "#313244"
-    readonly property color cardHover: "#45475a"
-    readonly property color border: "#585b70"
-    readonly property color textColor: "#cdd6f4"
-    readonly property color muted: "#a6adc8"
-    readonly property color accent: "#89b4fa"
-    readonly property color green: "#a6e3a1"
-    readonly property color yellow: "#f9e2af"
-    readonly property color red: "#f38ba8"
-    readonly property color lavender: "#b4befe"
-    readonly property var pageTitles: ["World", "Alarms", "Stopwatch", "Timer"]
-    readonly property int fontSmall: 16
-    readonly property int fontLarge: 24
-    readonly property int fontDisplay: 56
-    readonly property int fontStrong: Font.DemiBold
-    readonly property int controlHeight: 52
-
-    property int pageIndex: 0
-    property int tick: 0
-    property string ringingTitle: "Alarm"
-    property string ringingMessage: ""
-    property bool stopwatchRunning: false
-    property double stopwatchStartedAt: 0
-    property double stopwatchBaseMs: 0
-    property int stopwatchTick: 0
-    property bool timerRunning: false
-    property int timerTotalSeconds: 0
-    property int timerRemainingSeconds: 0
-    property double timerTargetMs: 0
-
-    ListModel { id: worldModel }
-    ListModel { id: alarmModel }
-    ListModel { id: lapModel }
-
-    Component.onCompleted: {
-        root.addWorldClock(backend.systemTimeZone())
-        root.addWorldClock("UTC")
-        root.addWorldClock("America/New_York")
-        root.addWorldClock("Europe/London")
-        root.addWorldClock("Asia/Tokyo")
-        alarmModel.append({ hour: 7, minute: 30, label: "Morning", enabled: false, lastKey: "" })
-    }
-
-    Timer {
-        interval: 1000
-        running: true
-        repeat: true
-        onTriggered: {
-            root.tick += 1
-            root.checkAlarms()
-        }
-    }
-
-    Timer {
-        interval: 50
-        running: root.stopwatchRunning
-        repeat: true
-        onTriggered: root.stopwatchTick += 1
-    }
-
-    Timer {
-        interval: 250
-        running: root.timerRunning
-        repeat: true
-        onTriggered: root.updateTimer()
-    }
-
-    function pad(value) {
-        return value < 10 ? "0" + value : "" + value
-    }
-
-    function alarmText(hour, minute) {
-        return pad(hour) + ":" + pad(minute)
-    }
-
-    function alarmRemainingText(hour, minute) {
-        let now = new Date()
-        let alarm = new Date(now)
-        alarm.setHours(hour, minute, 0, 0)
-        if (alarm <= now) {
-            alarm.setDate(alarm.getDate() + 1)
-        }
-
-        let totalMinutes = Math.ceil((alarm.getTime() - now.getTime()) / 60000)
-        let hours = Math.floor(totalMinutes / 60)
-        let minutes = totalMinutes % 60
-        let parts = []
-        if (hours > 0) {
-            parts.push(hours + " " + (hours === 1 ? "hour" : "hours"))
-        }
-        if (minutes > 0 || hours === 0) {
-            parts.push(minutes + " " + (minutes === 1 ? "minute" : "minutes"))
-        }
-        return "In " + parts.join(" ")
-    }
-
-    function formatMs(ms) {
-        ms = Math.max(0, Math.floor(ms))
-        let centis = Math.floor((ms % 1000) / 10)
-        let totalSeconds = Math.floor(ms / 1000)
-        let seconds = totalSeconds % 60
-        let minutes = Math.floor(totalSeconds / 60) % 60
-        let hours = Math.floor(totalSeconds / 3600)
-        if (hours > 0) {
-            return pad(hours) + ":" + pad(minutes) + ":" + pad(seconds) + "." + pad(centis)
-        }
-        return pad(minutes) + ":" + pad(seconds) + "." + pad(centis)
-    }
-
-    function formatDuration(seconds) {
-        seconds = Math.max(0, Math.floor(seconds))
-        let hours = Math.floor(seconds / 3600)
-        let minutes = Math.floor((seconds % 3600) / 60)
-        let secs = seconds % 60
-        return pad(hours) + ":" + pad(minutes) + ":" + pad(secs)
-    }
-
-    function movePage(offset) {
-        const count = root.pageTitles.length
-        root.pageIndex = (root.pageIndex + offset + count) % count
-        const tab = pageTabs.itemAt(root.pageIndex)
-        if (tab) {
-            tab.forceActiveFocus()
-        }
-    }
-
-    function handlePageNavigationKey(event) {
-        if (event.accepted || event.modifiers !== Qt.NoModifier || zoneCombo.popup.visible) {
-            return
-        }
-
-        if (event.key === Qt.Key_Left || event.key === Qt.Key_Up || event.key === Qt.Key_H || event.key === Qt.Key_K) {
-            root.movePage(-1)
-            event.accepted = true
-        } else if (event.key === Qt.Key_Right || event.key === Qt.Key_Down || event.key === Qt.Key_L || event.key === Qt.Key_J) {
-            root.movePage(1)
-            event.accepted = true
-        }
-    }
-
-    function stopwatchElapsedMs() {
-        if (root.stopwatchRunning) {
-            return root.stopwatchBaseMs + Date.now() - root.stopwatchStartedAt
-        }
-        return root.stopwatchBaseMs
-    }
-
-    function addWorldClock(zoneId) {
-        if (!zoneId || zoneId.length === 0) {
-            return
-        }
-        for (let i = 0; i < worldModel.count; ++i) {
-            if (worldModel.get(i).zoneId === zoneId) {
-                return
-            }
-        }
-        worldModel.append({ zoneId: zoneId })
-    }
-
-    function addAlarm() {
-        let label = alarmLabel.text.trim()
-        alarmModel.append({
-            hour: alarmTime.hour,
-            minute: alarmTime.minute,
-            label: label.length > 0 ? label : "Alarm",
-            enabled: true,
-            lastKey: ""
-        })
-        alarmLabel.text = ""
-    }
-
-    function checkAlarms() {
-        let now = new Date()
-        let key = now.getFullYear() + "-" + now.getMonth() + "-" + now.getDate() + "-" + now.getHours() + "-" + now.getMinutes()
-        for (let i = 0; i < alarmModel.count; ++i) {
-            let alarm = alarmModel.get(i)
-            if (alarm.enabled && alarm.hour === now.getHours() && alarm.minute === now.getMinutes() && alarm.lastKey !== key) {
-                alarmModel.setProperty(i, "lastKey", key)
-                root.showRinging("Alarm", alarm.label + " at " + alarmText(alarm.hour, alarm.minute), true)
-            }
-        }
-    }
-
-    function showRinging(title, message, alarm) {
-        root.ringingTitle = title
-        root.ringingMessage = message
-        if (alarm) {
-            backend.playAlarm()
-        } else {
-            backend.playTimer()
-        }
-        ringingPopup.open()
-        root.raise()
-        root.requestActivate()
-    }
-
-    function startStopwatch() {
-        root.stopwatchStartedAt = Date.now()
-        root.stopwatchRunning = true
-    }
-
-    function pauseStopwatch() {
-        root.stopwatchBaseMs = root.stopwatchElapsedMs()
-        root.stopwatchRunning = false
-    }
-
-    function resetStopwatch() {
-        root.stopwatchRunning = false
-        root.stopwatchBaseMs = 0
-        root.stopwatchStartedAt = 0
-        lapModel.clear()
-    }
-
-    function addLap() {
-        lapModel.insert(0, { number: lapModel.count + 1, elapsed: root.formatMs(root.stopwatchElapsedMs()) })
-    }
-
-    function setTimerPreset(minutes) {
-        timerTime.setTime(0, minutes, 0)
-    }
-
-    function startTimer() {
-        timerTime.commitText()
-        let total = timerTime.totalSeconds
-        if (total <= 0) {
-            return
-        }
-        root.timerTotalSeconds = total
-        root.timerRemainingSeconds = total
-        root.timerTargetMs = Date.now() + total * 1000
-        root.timerRunning = true
-    }
-
-    function pauseTimer() {
-        root.timerRemainingSeconds = Math.max(0, Math.ceil((root.timerTargetMs - Date.now()) / 1000))
-        root.timerRunning = false
-    }
-
-    function resumeTimer() {
-        if (root.timerRemainingSeconds <= 0) {
-            return
-        }
-        root.timerTargetMs = Date.now() + root.timerRemainingSeconds * 1000
-        root.timerRunning = true
-    }
-
-    function resetTimer() {
-        root.timerRunning = false
-        root.timerTotalSeconds = 0
-        root.timerRemainingSeconds = 0
-    }
-
-    function updateTimer() {
-        root.timerRemainingSeconds = Math.max(0, Math.ceil((root.timerTargetMs - Date.now()) / 1000))
-        if (root.timerRemainingSeconds <= 0) {
-            root.timerRunning = false
-            root.showRinging("Timer", "Countdown complete", false)
-        }
-    }
-
-    Rectangle {
-        id: appShell
-        anchors.fill: parent
-        color: root.bg
-        focus: true
-
-        Component.onCompleted: forceActiveFocus()
-
-        Keys.priority: Keys.AfterItem
-        Keys.onPressed: event => root.handlePageNavigationKey(event)
-
-        ColumnLayout {
-            anchors.fill: parent
-            anchors.margins: 24
-            spacing: 18
-
-            TabBar {
-                id: pageTabs
-                Layout.alignment: Qt.AlignHCenter
-                currentIndex: root.pageIndex
-                spacing: 6
-                background: Rectangle {
-                    color: root.panel
-                    radius: 18
-                    border.width: 1
-                    border.color: root.border
-                }
-
-                onCurrentIndexChanged: root.pageIndex = currentIndex
-
-                Repeater {
-                    model: root.pageTitles
-                    delegate: ClockTabButton { text: modelData }
-                }
-            }
-
-            StackLayout {
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                currentIndex: root.pageIndex
-
-                    Item {
-                        ColumnLayout {
-                            anchors.fill: parent
-                            spacing: 16
-
-                            RowLayout {
-                                Layout.fillWidth: true
-                                spacing: 10
-
-                                ComboBox {
-                                    id: zoneCombo
-                                    Layout.preferredWidth: Math.min(360, root.width - 180)
-                                    Layout.minimumWidth: 220
-                                    Layout.preferredHeight: root.controlHeight
-                                    editable: true
-                                    model: backend.zones
-                                    currentIndex: Math.max(0, backend.zones.indexOf(backend.systemTimeZone()))
-                                    font.pixelSize: root.fontSmall
-                                    delegate: ItemDelegate {
-                                        width: zoneCombo.width
-                                        height: 42
-                                        text: modelData
-                                        hoverEnabled: true
-                                        contentItem: Text {
-                                            text: parent.text
-                                            color: root.textColor
-                                            verticalAlignment: Text.AlignVCenter
-                                            elide: Text.ElideRight
-                                            font.pixelSize: root.fontSmall
-                                        }
-                                        background: Rectangle {
-                                            color: parent.highlighted ? root.accent : (parent.hovered ? root.cardHover : root.card)
-                                        }
-                                    }
-                                    contentItem: Text {
-                                        leftPadding: 12
-                                        rightPadding: 28
-                                        text: zoneCombo.displayText
-                                        color: root.textColor
-                                        verticalAlignment: Text.AlignVCenter
-                                        elide: Text.ElideRight
-                                        font: zoneCombo.font
-                                    }
-                                    background: Rectangle {
-                                        color: root.card
-                                        radius: 14
-                                        border.width: 1
-                                        border.color: zoneCombo.activeFocus ? root.accent : root.border
-                                    }
-                                    popup: Popup {
-                                        y: zoneCombo.height + 6
-                                        width: zoneCombo.width
-                                        height: Math.min(contentItem.implicitHeight + 2, root.height - zoneCombo.mapToItem(root.contentItem, 0, 0).y - zoneCombo.height - 36)
-                                        padding: 1
-                                        contentItem: ListView {
-                                            clip: true
-                                            implicitHeight: contentHeight
-                                            model: zoneCombo.popup.visible ? zoneCombo.delegateModel : null
-                                            currentIndex: zoneCombo.highlightedIndex
-                                            ScrollBar.vertical: ScrollBar {
-                                                policy: ScrollBar.AsNeeded
-                                                contentItem: Rectangle {
-                                                    implicitWidth: 6
-                                                    radius: 3
-                                                    color: root.border
-                                                }
-                                                background: Rectangle { color: root.panel }
-                                            }
-                                        }
-                                        background: Rectangle {
-                                            color: root.card
-                                            radius: 14
-                                            border.width: 1
-                                            border.color: root.border
-                                        }
-                                    }
-                                }
-
-                                ActionButton {
-                                    text: "Add"
-                                    accentColor: root.accent
-                                    onClicked: root.addWorldClock(zoneCombo.currentText)
-                                }
-                            }
-
-                            Flickable {
-                                Layout.fillWidth: true
-                                Layout.fillHeight: true
-                                clip: true
-                                contentHeight: worldGrid.implicitHeight
-
-                                GridLayout {
-                                    id: worldGrid
-                                    width: parent.width
-                                    columns: root.width < 760 ? 1 : 2
-                                    columnSpacing: 14
-                                    rowSpacing: 14
-
-                                    Repeater {
-                                        model: worldModel
-                                        delegate: Rectangle {
-                                            Layout.preferredWidth: Math.max(220, (worldGrid.width - (worldGrid.columns - 1) * worldGrid.columnSpacing) / worldGrid.columns)
-                                            Layout.preferredHeight: 132
-                                            color: root.card
-                                            radius: 24
-                                            border.width: 1
-                                            border.color: root.border
-
-                                            ColumnLayout {
-                                                anchors.fill: parent
-                                                anchors.margins: 18
-                                                spacing: 8
-
-                                                RowLayout {
-                                                    Layout.fillWidth: true
-                                                    spacing: 10
-
-                                                    ColumnLayout {
-                                                        Layout.fillWidth: true
-                                                        spacing: 2
-
-                                                        Text {
-                                                            text: backend.zoneTitle(zoneId)
-                                                            color: root.textColor
-                                                            font.pixelSize: root.fontLarge
-                                                            font.weight: root.fontStrong
-                                                            elide: Text.ElideRight
-                                                            Layout.fillWidth: true
-                                                        }
-
-                                                        Text {
-                                                            text: zoneId
-                                                            color: root.muted
-                                                            font.pixelSize: root.fontSmall
-                                                            elide: Text.ElideRight
-                                                            Layout.fillWidth: true
-                                                        }
-                                                    }
-
-                                                    DestructiveButton {
-                                                        visible: worldModel.count > 1
-                                                        text: "Remove"
-                                                        onClicked: worldModel.remove(index)
-                                                    }
-                                                }
-
-                                                RowLayout {
-                                                    Layout.fillWidth: true
-                                                    spacing: 12
-
-                                                    Text {
-                                                        text: backend.timeForZone(zoneId) + (root.tick >= 0 ? "" : "")
-                                                        color: root.accent
-                                                        font.pixelSize: root.fontLarge
-                                                        font.weight: root.fontStrong
-                                                    }
-
-                                                    ColumnLayout {
-                                                        Layout.fillWidth: true
-                                                        spacing: 2
-                                                        Text {
-                                                            text: backend.dateForZone(zoneId) + (root.tick >= 0 ? "" : "")
-                                                            color: root.textColor
-                                                            font.pixelSize: root.fontSmall
-                                                        }
-                                                        Text {
-                                                            text: backend.offsetForZone(zoneId) + (root.tick >= 0 ? "" : "")
-                                                            color: root.muted
-                                                            font.pixelSize: root.fontSmall
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    Item {
-                        ColumnLayout {
-                            anchors.fill: parent
-                            spacing: 16
-
-                            Rectangle {
-                                id: alarmEditor
-                                readonly property bool compact: width < 660
-
-                                Layout.fillWidth: true
-                                Layout.preferredHeight: alarmEditor.compact ? 154 : 92
-                                color: root.card
-                                radius: 24
-                                border.width: 1
-                                border.color: root.border
-
-                                GridLayout {
-                                    anchors.fill: parent
-                                    anchors.margins: 16
-                                    columns: alarmEditor.compact ? 3 : 4
-                                    columnSpacing: 10
-                                    rowSpacing: 10
-
-                                    TimeBox {
-                                        id: alarmTime
-                                        showSeconds: false
-                                        maxHour: 23
-                                        Layout.row: 0
-                                        Layout.column: 0
-                                        Layout.preferredWidth: 124
-                                        Component.onCompleted: setTime(7, 30, 0)
-                                    }
-                                    TextField {
-                                        id: alarmLabel
-                                        Layout.row: alarmEditor.compact ? 1 : 0
-                                        Layout.column: alarmEditor.compact ? 0 : 1
-                                        Layout.columnSpan: alarmEditor.compact ? 3 : 1
-                                        Layout.fillWidth: true
-                                        Layout.preferredHeight: root.controlHeight
-                                        placeholderText: "Label"
-                                        color: root.textColor
-                                        placeholderTextColor: root.muted
-                                        font.pixelSize: root.fontLarge
-                                        background: Rectangle {
-                                            color: root.panel
-                                            radius: 14
-                                            border.width: 1
-                                            border.color: parent.activeFocus ? root.accent : root.border
-                                        }
-                                        onAccepted: root.addAlarm()
-                                    }
-                                    ActionButton {
-                                        Layout.row: 0
-                                        Layout.column: alarmEditor.compact ? 1 : 2
-                                        text: "Add Alarm"
-                                        accentColor: root.accent
-                                        onClicked: root.addAlarm()
-                                    }
-                                    ActionButton {
-                                        Layout.row: 0
-                                        Layout.column: alarmEditor.compact ? 2 : 3
-                                        text: "Preview"
-                                        accentColor: root.lavender
-                                        onClicked: backend.previewAlarm()
-                                    }
-                                }
-                            }
-
-                            ListView {
-                                Layout.fillWidth: true
-                                Layout.fillHeight: true
-                                spacing: 12
-                                clip: true
-                                model: alarmModel
-                                delegate: Rectangle {
-                                    width: ListView.view.width
-                                    height: 94
-                                    color: root.card
-                                    radius: 24
-                                    border.width: 1
-                                    border.color: enabled ? root.accent : root.border
-
-                                    RowLayout {
-                                        anchors.fill: parent
-                                        anchors.margins: 18
-                                        spacing: 16
-
-                                        Text {
-                                            text: root.alarmText(hour, minute)
-                                            color: enabled ? root.textColor : root.muted
-                                            font.pixelSize: root.fontLarge
-                                            font.weight: root.fontStrong
-                                        }
-
-                                        ColumnLayout {
-                                            Layout.fillWidth: true
-                                            Layout.minimumWidth: 0
-                                            spacing: 4
-                                            Text {
-                                                text: label
-                                                color: root.textColor
-                                                font.pixelSize: root.fontSmall
-                                                font.weight: root.fontStrong
-                                                elide: Text.ElideRight
-                                                Layout.fillWidth: true
-                                            }
-                                            Text {
-                                                text: enabled ? root.alarmRemainingText(hour, minute) + (root.tick >= 0 ? "" : "") : "Off"
-                                                color: root.muted
-                                                font.pixelSize: root.fontSmall
-                                                elide: Text.ElideRight
-                                                Layout.fillWidth: true
-                                            }
-                                        }
-
-                                        Switch {
-                                            checked: enabled
-                                            onToggled: alarmModel.setProperty(index, "enabled", checked)
-                                        }
-
-                                        DestructiveButton {
-                                            text: "Remove"
-                                            onClicked: alarmModel.remove(index)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    Item {
-                        ColumnLayout {
-                            anchors.fill: parent
-                            spacing: 18
-
-                            Rectangle {
-                                Layout.fillWidth: true
-                                Layout.preferredHeight: 210
-                                color: root.card
-                                radius: 28
-                                border.width: 1
-                                border.color: root.border
-
-                                ColumnLayout {
-                                    anchors.centerIn: parent
-                                    spacing: 18
-
-                                    Text {
-                                        text: root.formatMs(root.stopwatchElapsedMs() + root.stopwatchTick * 0)
-                                        color: root.accent
-                                        font.pixelSize: root.fontDisplay
-                                        font.weight: root.fontStrong
-                                        horizontalAlignment: Text.AlignHCenter
-                                        Layout.alignment: Qt.AlignHCenter
-                                    }
-
-                                    RowLayout {
-                                        Layout.alignment: Qt.AlignHCenter
-                                        spacing: 12
-                                        ActionButton {
-                                            text: root.stopwatchRunning ? "Pause" : "Start"
-                                            accentColor: root.stopwatchRunning ? root.yellow : root.green
-                                            onClicked: root.stopwatchRunning ? root.pauseStopwatch() : root.startStopwatch()
-                                        }
-                                        ActionButton {
-                                            text: root.stopwatchRunning ? "Lap" : "Reset"
-                                            accentColor: root.lavender
-                                            onClicked: root.stopwatchRunning ? root.addLap() : root.resetStopwatch()
-                                        }
-                                    }
-                                }
-                            }
-
-                            Rectangle {
-                                Layout.fillWidth: true
-                                Layout.fillHeight: true
-                                color: root.card
-                                radius: 24
-                                border.width: 1
-                                border.color: root.border
-
-                                ListView {
-                                    anchors.fill: parent
-                                    anchors.margins: 12
-                                    spacing: 8
-                                    clip: true
-                                    model: lapModel
-                                    delegate: Rectangle {
-                                        width: ListView.view.width
-                                        height: 42
-                                        color: root.panel
-                                        radius: 12
-                                        RowLayout {
-                                            anchors.fill: parent
-                                            anchors.leftMargin: 14
-                                            anchors.rightMargin: 14
-                                            Text { text: "Lap " + number; color: root.muted; font.pixelSize: root.fontSmall; Layout.fillWidth: true }
-                                            Text { text: elapsed; color: root.textColor; font.pixelSize: root.fontSmall; font.weight: root.fontStrong }
-                                        }
-                                    }
-                                    Label {
-                                        anchors.centerIn: parent
-                                        visible: lapModel.count === 0
-                                        text: "Laps appear here"
-                                        color: root.muted
-                                        font.pixelSize: root.fontSmall
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    Item {
-                        ColumnLayout {
-                            anchors.fill: parent
-                            spacing: 18
-
-                            Rectangle {
-                                Layout.fillWidth: true
-                                Layout.fillHeight: true
-                                color: root.card
-                                radius: 28
-                                border.width: 1
-                                border.color: root.border
-
-                                ColumnLayout {
-                                    anchors.centerIn: parent
-                                    width: Math.min(parent.width - 48, 560)
-                                    spacing: 22
-
-                                    Text {
-                                        text: root.timerTotalSeconds > 0 ? root.formatDuration(root.timerRemainingSeconds) : "00:00:00"
-                                        color: root.timerRunning ? root.green : root.accent
-                                        font.pixelSize: root.fontDisplay
-                                        font.weight: root.fontStrong
-                                        horizontalAlignment: Text.AlignHCenter
-                                        Layout.alignment: Qt.AlignHCenter
-                                    }
-
-                                    RowLayout {
-                                        Layout.alignment: Qt.AlignHCenter
-                                        spacing: 8
-                                        TimeBox {
-                                            id: timerTime
-                                            showSeconds: true
-                                            maxHour: 99
-                                            Layout.preferredWidth: 174
-                                            enabled: !root.timerRunning
-                                            Component.onCompleted: setTime(0, 5, 0)
-                                        }
-                                    }
-
-                                    RowLayout {
-                                        Layout.alignment: Qt.AlignHCenter
-                                        spacing: 8
-                                        SmallButton { text: "5 min"; onClicked: root.setTimerPreset(5) }
-                                        SmallButton { text: "10 min"; onClicked: root.setTimerPreset(10) }
-                                        SmallButton { text: "25 min"; onClicked: root.setTimerPreset(25) }
-                                        SmallButton { text: "Preview"; onClicked: backend.previewTimer() }
-                                    }
-
-                                    RowLayout {
-                                        Layout.alignment: Qt.AlignHCenter
-                                        spacing: 12
-                                        ActionButton {
-                                            text: root.timerRunning ? "Pause" : (root.timerRemainingSeconds > 0 ? "Resume" : "Start")
-                                            accentColor: root.timerRunning ? root.yellow : root.green
-                                            onClicked: root.timerRunning ? root.pauseTimer() : (root.timerRemainingSeconds > 0 ? root.resumeTimer() : root.startTimer())
-                                        }
-                                        ActionButton { text: "Reset"; accentColor: root.lavender; onClicked: root.resetTimer() }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-        }
-    }
-
-    Popup {
-        id: ringingPopup
-        modal: true
-        focus: true
-        closePolicy: Popup.NoAutoClose
-        width: Math.min(root.width - 80, 430)
-        x: (root.width - width) / 2
-        y: (root.height - height) / 2
-        padding: 0
-        background: Rectangle {
-            color: root.panel
-            radius: 28
-            border.width: 2
-            border.color: root.accent
-        }
-
-        ColumnLayout {
-            width: parent.width
-            spacing: 18
-
-            ColumnLayout {
-                Layout.fillWidth: true
-                Layout.margins: 26
-                spacing: 12
-
-                Text {
-                    text: root.ringingTitle
-                    color: root.textColor
-                    font.pixelSize: root.fontLarge
-                    font.weight: root.fontStrong
-                    Layout.fillWidth: true
-                    horizontalAlignment: Text.AlignHCenter
-                }
-
-                Text {
-                    text: root.ringingMessage
-                    color: root.muted
-                    font.pixelSize: root.fontSmall
-                    wrapMode: Text.WordWrap
-                    Layout.fillWidth: true
-                    horizontalAlignment: Text.AlignHCenter
-                }
-
-                ActionButton {
-                    Layout.alignment: Qt.AlignHCenter
-                    text: "Stop"
-                    accentColor: root.red
-                    onClicked: {
-                        backend.stopSound()
-                        ringingPopup.close()
-                    }
-                }
-            }
-        }
-    }
-
-    component ClockTabButton: TabButton {
-        id: tab
-        hoverEnabled: true
-        focusPolicy: Qt.StrongFocus
-        padding: 0
-        implicitWidth: Math.max(104, contentItem.implicitWidth + 34)
-        implicitHeight: 42
-        Keys.onPressed: event => {
-            if (event.key === Qt.Key_H || event.key === Qt.Key_K) {
-                root.movePage(-1)
-                event.accepted = true
-            } else if (event.key === Qt.Key_L || event.key === Qt.Key_J) {
-                root.movePage(1)
-                event.accepted = true
-            }
-        }
-        contentItem: Text {
-            text: tab.text
-            color: tab.checked ? root.bg : root.textColor
-            horizontalAlignment: Text.AlignHCenter
-            verticalAlignment: Text.AlignVCenter
-            font.pixelSize: root.fontSmall
-            font.weight: root.fontStrong
-        }
-        background: Rectangle {
-            radius: 18
-            color: tab.checked ? root.accent : (tab.hovered || tab.activeFocus ? root.cardHover : "transparent")
-            border.width: 1
-            border.color: tab.checked ? root.accent : "transparent"
-        }
-    }
-
-    component ActionButton: Button {
-        id: button
-        property color accentColor: root.accent
-        hoverEnabled: true
-        focusPolicy: Qt.StrongFocus
-        padding: 0
-        implicitWidth: Math.max(106, contentItem.implicitWidth + 30)
-        implicitHeight: root.controlHeight
-        contentItem: Text {
-            text: button.text
-            color: root.bg
-            horizontalAlignment: Text.AlignHCenter
-            verticalAlignment: Text.AlignVCenter
-            font.pixelSize: root.fontSmall
-            font.weight: root.fontStrong
-        }
-        background: Rectangle {
-            radius: 16
-            color: button.down ? Qt.darker(button.accentColor, 1.2) : (button.hovered || button.activeFocus ? Qt.lighter(button.accentColor, 1.08) : button.accentColor)
-        }
-    }
-
-    component DestructiveButton: ToolButton {
-        id: button
-        hoverEnabled: true
-        focusPolicy: Qt.StrongFocus
-        padding: 0
-        implicitWidth: Math.max(84, contentItem.implicitWidth + 24)
-        implicitHeight: 40
-        contentItem: Text {
-            text: button.text
-            color: root.red
-            horizontalAlignment: Text.AlignHCenter
-            verticalAlignment: Text.AlignVCenter
-            font.pixelSize: root.fontSmall
-            font.weight: root.fontStrong
-        }
-        background: Rectangle {
-            radius: 12
-            color: button.hovered || button.activeFocus ? Qt.rgba(0.95, 0.55, 0.66, 0.14) : "transparent"
-        }
-    }
-
-    component TimeBox: Rectangle {
-        id: control
-        property bool showSeconds: true
-        property int maxHour: 23
-        property int hour: 0
-        property int minute: 0
-        property int second: 0
-        readonly property int totalSeconds: hour * 3600 + minute * 60 + second
-        readonly property int digitCount: showSeconds ? 6 : 4
-        readonly property var digitPositions: showSeconds ? [0, 1, 3, 4, 6, 7] : [0, 1, 3, 4]
-
-        implicitWidth: showSeconds ? 174 : 124
-        implicitHeight: root.controlHeight
-        color: root.panel
-        radius: 16
-        opacity: enabled ? 1.0 : 0.55
-        border.width: 1
-        border.color: input.activeFocus ? root.accent : root.border
-
-        function clamp(number, low, high) {
-            return Math.max(low, Math.min(high, number))
-        }
-
-        function padded(number) {
-            let text = "" + Math.max(0, number)
-            while (text.length < 2) {
-                text = "0" + text
-            }
-            return text.slice(-2)
-        }
-
-        function formatTime() {
-            const base = control.padded(control.hour) + ":" + control.padded(control.minute)
-            return control.showSeconds ? base + ":" + control.padded(control.second) : base
-        }
-
-        function parseText(text) {
-            let digits = text.replace(/[^0-9]/g, "")
-            while (digits.length < control.digitCount) {
-                digits += "0"
-            }
-            digits = digits.slice(0, control.digitCount)
-            return {
-                hour: parseInt(digits.slice(0, 2), 10),
-                minute: parseInt(digits.slice(2, 4), 10),
-                second: control.showSeconds ? parseInt(digits.slice(4, 6), 10) : 0
-            }
-        }
-
-        function normalizeParts(parts) {
-            return {
-                hour: control.clamp(isNaN(parts.hour) ? control.hour : parts.hour, 0, control.maxHour),
-                minute: control.clamp(isNaN(parts.minute) ? control.minute : parts.minute, 0, 59),
-                second: control.showSeconds ? control.clamp(isNaN(parts.second) ? control.second : parts.second, 0, 59) : 0
-            }
-        }
-
-        function setTime(hour, minute, second) {
-            const parts = control.normalizeParts({ hour: hour, minute: minute, second: second })
-            control.hour = parts.hour
-            control.minute = parts.minute
-            control.second = parts.second
-            input.text = control.formatTime()
-        }
-
-        function commitText() {
-            const parts = control.normalizeParts(control.parseText(input.text))
-            control.hour = parts.hour
-            control.minute = parts.minute
-            control.second = parts.second
-            input.text = control.formatTime()
-        }
-
-        function activeDigit() {
-            const start = Math.min(input.selectionStart, input.selectionEnd)
-            if (input.selectionStart !== input.selectionEnd) {
-                for (let i = 0; i < control.digitPositions.length; ++i) {
-                    if (control.digitPositions[i] >= start) {
-                        return i
-                    }
-                }
-            }
-            const cursor = input.cursorPosition
-            for (let j = 0; j < control.digitPositions.length; ++j) {
-                if (control.digitPositions[j] >= cursor) {
-                    return j
-                }
-            }
-            return control.digitPositions.length - 1
-        }
-
-        function selectDigit(index) {
-            index = Math.max(0, Math.min(control.digitPositions.length - 1, index))
-            const position = control.digitPositions[index]
-            input.forceActiveFocus()
-            input.select(position, position + 1)
-        }
-
-        function moveDigit(offset) {
-            control.selectDigit(control.activeDigit() + offset)
-        }
-
-        function changeDigit(offset) {
-            const digitIndex = control.activeDigit()
-            control.commitText()
-            const position = control.digitPositions[digitIndex]
-            const currentDigit = parseInt(input.text.charAt(position), 10)
-
-            for (let step = 1; step <= 10; ++step) {
-                let nextDigit = (currentDigit + offset * step + 100) % 10
-                let chars = input.text.split("")
-                chars[position] = "" + nextDigit
-                const parts = control.parseText(chars.join(""))
-                if (parts.hour >= 0 && parts.hour <= control.maxHour && parts.minute >= 0 && parts.minute <= 59 && parts.second >= 0 && parts.second <= 59) {
-                    control.hour = parts.hour
-                    control.minute = parts.minute
-                    control.second = parts.second
-                    input.text = control.formatTime()
-                    control.selectDigit(digitIndex)
-                    return
-                }
-            }
-        }
-
-        onHourChanged: if (!input.activeFocus) input.text = control.formatTime()
-        onMinuteChanged: if (!input.activeFocus) input.text = control.formatTime()
-        onSecondChanged: if (!input.activeFocus) input.text = control.formatTime()
-
-        onShowSecondsChanged: {
-            if (!input.activeFocus) {
-                input.text = control.formatTime()
-            }
-        }
-
-        TextInput {
-            id: input
-            anchors.fill: parent
-            anchors.leftMargin: 10
-            anchors.rightMargin: 10
-            text: control.formatTime()
-            enabled: control.enabled
-            color: root.textColor
-            selectionColor: root.accent
-            selectedTextColor: root.bg
-            horizontalAlignment: Text.AlignHCenter
-            verticalAlignment: Text.AlignVCenter
-            font.pixelSize: root.fontLarge
-            font.weight: root.fontStrong
-            inputMask: control.showSeconds ? "00:00:00" : "00:00"
-            inputMethodHints: Qt.ImhDigitsOnly
-            selectByMouse: true
-            activeFocusOnPress: true
-
-            onTextEdited: {
-                const parts = control.parseText(text)
-                if (parts.hour >= 0 && parts.hour <= control.maxHour && parts.minute >= 0 && parts.minute <= 59 && parts.second >= 0 && parts.second <= 59) {
-                    control.hour = parts.hour
-                    control.minute = parts.minute
-                    control.second = parts.second
-                }
-            }
-
-            onEditingFinished: control.commitText()
-            onActiveFocusChanged: if (!activeFocus) control.commitText()
-
-            Keys.priority: Keys.BeforeItem
-            Keys.onPressed: event => {
-                if (event.key === Qt.Key_Up || event.key === Qt.Key_K) {
-                    control.changeDigit(1)
-                    event.accepted = true
-                } else if (event.key === Qt.Key_Down || event.key === Qt.Key_J) {
-                    control.changeDigit(-1)
-                    event.accepted = true
-                } else if (event.key === Qt.Key_Left || event.key === Qt.Key_H) {
-                    control.moveDigit(-1)
-                    event.accepted = true
-                } else if (event.key === Qt.Key_Right || event.key === Qt.Key_L) {
-                    control.moveDigit(1)
-                    event.accepted = true
-                } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                    control.commitText()
-                    event.accepted = true
-                }
-            }
-        }
-    }
-
-    component SmallButton: Button {
-        id: button
-        hoverEnabled: true
-        padding: 0
-        implicitWidth: 76
-        implicitHeight: 36
-        contentItem: Text {
-            text: button.text
-            color: root.textColor
-            horizontalAlignment: Text.AlignHCenter
-            verticalAlignment: Text.AlignVCenter
-            font.pixelSize: root.fontSmall
-            font.weight: root.fontStrong
-        }
-        background: Rectangle {
-            radius: 14
-            color: button.down ? Qt.darker(root.cardHover, 1.2) : (button.hovered || button.activeFocus ? root.cardHover : root.card)
-            border.width: 1
-            border.color: button.hovered || button.activeFocus ? root.accent : root.border
-        }
-    }
-}
-)qml";
-
-int main(int argc, char *argv[])
+void drawTabs(ClockState &state)
 {
-    QGuiApplication app(argc, argv);
-    QGuiApplication::setApplicationName(QStringLiteral("clocks"));
-    QGuiApplication::setDesktopFileName(QStringLiteral("clocks"));
-    QQuickStyle::setStyle(QStringLiteral("Basic"));
-
-    ClockBackend backend;
-    EscapeFilter escapeFilter;
-    app.installEventFilter(&escapeFilter);
-
-    QQmlApplicationEngine engine;
-    engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
-    QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed, &app,
-                     [] { QGuiApplication::exit(1); }, Qt::QueuedConnection);
-    engine.loadData(qml, QUrl(QStringLiteral("qrc:/Clocks.qml")));
-
-    return app.exec();
+    constexpr const char *titles[] = {"World", "Alarms", "Stopwatch", "Timer"};
+    const float tabWidth = 122.0f;
+    const float totalWidth = tabWidth * 4.0f + ImGui::GetStyle().ItemSpacing.x * 3.0f;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (ImGui::GetContentRegionAvail().x - totalWidth) * 0.5f));
+    for (int i = 0; i < 4; ++i) {
+        ImGui::PushID(i);
+        const bool active = state.page == i;
+        const bool clicked = active ? ui::accentButton(titles[i], ImVec2(tabWidth, 42.0f)) : ui::subtleButton(titles[i], ImVec2(tabWidth, 42.0f));
+        if (clicked) {
+            state.page = i;
+        }
+        ImGui::PopID();
+        if (i != 3) {
+            ImGui::SameLine();
+        }
+    }
 }
 
-#include "clocks.moc"
+void drawWorldPage(ClockState &state)
+{
+    ImGui::PushItemWidth(std::min(360.0f, ImGui::GetContentRegionAvail().x - 130.0f));
+    ImGui::InputTextWithHint("##zone-filter", "Filter time zones", state.zoneFilter, sizeof(state.zoneFilter));
+    ImGui::PopItemWidth();
+    ImGui::SameLine();
+
+    const std::string preview = state.selectedZone >= 0 && state.selectedZone < static_cast<int>(state.zones.size()) ? state.zones[state.selectedZone] : "UTC";
+    ImGui::PushItemWidth(std::min(360.0f, ImGui::GetContentRegionAvail().x - 120.0f));
+    if (ImGui::BeginCombo("##zone-combo", preview.c_str())) {
+        for (int i = 0; i < static_cast<int>(state.zones.size()); ++i) {
+            if (!containsInsensitive(state.zones[i], state.zoneFilter)) {
+                continue;
+            }
+            const bool selected = i == state.selectedZone;
+            if (ImGui::Selectable(state.zones[i].c_str(), selected)) {
+                state.selectedZone = i;
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::PopItemWidth();
+    ImGui::SameLine();
+    if (ui::accentButton("Add", ImVec2(86.0f, 0.0f))) {
+        state.addWorldClock(preview);
+    }
+
+    ImGui::Separator();
+    ImGui::BeginChild("world-scroll", ImVec2(0.0f, 0.0f), false);
+    const float spacing = ImGui::GetStyle().ItemSpacing.x;
+    const float width = ImGui::GetContentRegionAvail().x;
+    const int columns = width < 720.0f ? 1 : 2;
+    const float cardWidth = columns == 1 ? width : (width - spacing) * 0.5f;
+    int removeIndex = -1;
+
+    for (int i = 0; i < static_cast<int>(state.worldZones.size()); ++i) {
+        ImGui::PushID(i);
+        ImGui::BeginChild("card", ImVec2(cardWidth, 132.0f), true);
+        ImGui::SetWindowFontScale(1.25f);
+        ImGui::TextColored(ui::colorText, "%s", zoneTitle(state.worldZones[i]).c_str());
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::TextColored(ui::colorMuted, "%s", state.worldZones[i].c_str());
+        ImGui::Spacing();
+        ImGui::SetWindowFontScale(1.35f);
+        ImGui::TextColored(ui::colorAccent, "%s", formatInZone(state.worldZones[i], "%H:%M").c_str());
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::SameLine();
+        ImGui::BeginGroup();
+        ImGui::TextColored(ui::colorText, "%s", formatInZone(state.worldZones[i], "%a, %b %d").c_str());
+        ImGui::TextColored(ui::colorMuted, "%s", offsetForZone(state.worldZones[i]).c_str());
+        ImGui::EndGroup();
+        if (state.worldZones.size() > 1) {
+            ImGui::SameLine(cardWidth - 104.0f);
+            if (ui::destructiveButton("Remove", ImVec2(92.0f, 34.0f))) {
+                removeIndex = i;
+            }
+        }
+        ImGui::EndChild();
+        ImGui::PopID();
+
+        if (columns == 2 && i % 2 == 0 && i + 1 < static_cast<int>(state.worldZones.size())) {
+            ImGui::SameLine();
+        }
+    }
+
+    if (removeIndex >= 0) {
+        state.worldZones.erase(state.worldZones.begin() + removeIndex);
+    }
+    ImGui::EndChild();
+}
+
+void drawAlarmsPage(ClockState &state)
+{
+    ImGui::BeginChild("alarm-editor", ImVec2(0.0f, 104.0f), true);
+    ImGui::PushItemWidth(120.0f);
+    if (ImGui::InputText("##alarm-time", state.alarmTimeText, sizeof(state.alarmTimeText), ImGuiInputTextFlags_CharsDecimal)) {
+        parseTimeText(state.alarmTimeText, false, 23, state.alarmTime);
+    }
+    ImGui::PopItemWidth();
+    ImGui::SameLine();
+    ImGui::PushItemWidth(std::max(160.0f, ImGui::GetContentRegionAvail().x - 254.0f));
+    ImGui::InputTextWithHint("##alarm-label", "Label", state.alarmLabel, sizeof(state.alarmLabel));
+    ImGui::PopItemWidth();
+    ImGui::SameLine();
+    if (ui::accentButton("Add Alarm", ImVec2(118.0f, 0.0f))) {
+        parseTimeText(state.alarmTimeText, false, 23, state.alarmTime);
+        setTimeText(state.alarmTimeText, sizeof(state.alarmTimeText), state.alarmTime, false);
+        std::string label = ui::trim(state.alarmLabel);
+        state.alarms.push_back({state.alarmTime.hour, state.alarmTime.minute, label.empty() ? "Alarm" : label, true, {}});
+        state.alarmLabel[0] = '\0';
+    }
+    ImGui::SameLine();
+    if (ui::accentButton("Preview", ImVec2(100.0f, 0.0f), ui::colorLavender)) {
+        state.audio.previewAlarm();
+    }
+    ImGui::TextColored(ui::colorMuted, "Use HH:MM. Enabled alarms ring once per matching minute.");
+    ImGui::EndChild();
+
+    ImGui::BeginChild("alarm-list", ImVec2(0.0f, 0.0f), false);
+    int removeIndex = -1;
+    for (int i = 0; i < static_cast<int>(state.alarms.size()); ++i) {
+        Alarm &alarm = state.alarms[i];
+        ImGui::PushID(i);
+        ImGui::BeginChild("alarm-card", ImVec2(0.0f, 94.0f), true);
+        ImGui::Checkbox("##enabled", &alarm.enabled);
+        ImGui::SameLine();
+        ImGui::SetWindowFontScale(1.35f);
+        ImGui::TextColored(alarm.enabled ? ui::colorText : ui::colorMuted, "%s", alarmText(alarm.hour, alarm.minute).c_str());
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::SameLine(170.0f);
+        ImGui::BeginGroup();
+        ImGui::TextColored(ui::colorText, "%s", alarm.label.c_str());
+        ImGui::TextColored(ui::colorMuted, "%s", alarm.enabled ? remainingAlarmText(alarm.hour, alarm.minute).c_str() : "Off");
+        ImGui::EndGroup();
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - 100.0f);
+        if (ui::destructiveButton("Remove", ImVec2(92.0f, 34.0f))) {
+            removeIndex = i;
+        }
+        ImGui::EndChild();
+        ImGui::PopID();
+    }
+    if (state.alarms.empty()) {
+        centerText("No alarms yet", 1.0f, ui::colorMuted);
+    }
+    if (removeIndex >= 0) {
+        state.alarms.erase(state.alarms.begin() + removeIndex);
+    }
+    ImGui::EndChild();
+}
+
+void drawStopwatchPage(ClockState &state)
+{
+    ImGui::BeginChild("stopwatch-display", ImVec2(0.0f, 210.0f), true);
+    ImGui::Dummy(ImVec2(0.0f, 28.0f));
+    centerText(formatMs(state.stopwatchElapsedMs()), 2.35f, ui::colorAccent);
+    ImGui::Spacing();
+    const float buttonWidth = 116.0f;
+    const float groupWidth = buttonWidth * 2.0f + ImGui::GetStyle().ItemSpacing.x;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (ImGui::GetContentRegionAvail().x - groupWidth) * 0.5f));
+    if (ui::accentButton(state.stopwatchRunning ? "Pause" : "Start", ImVec2(buttonWidth, 46.0f), state.stopwatchRunning ? ui::colorYellow : ui::colorGreen)) {
+        state.stopwatchRunning ? state.pauseStopwatch() : state.startStopwatch();
+    }
+    ImGui::SameLine();
+    if (ui::accentButton(state.stopwatchRunning ? "Lap" : "Reset", ImVec2(buttonWidth, 46.0f), ui::colorLavender)) {
+        state.stopwatchRunning ? state.addLap() : state.resetStopwatch();
+    }
+    ImGui::EndChild();
+
+    ImGui::BeginChild("laps", ImVec2(0.0f, 0.0f), true);
+    if (state.laps.empty()) {
+        centerText("Laps appear here", 1.0f, ui::colorMuted);
+    }
+    for (const Lap &lap : state.laps) {
+        ImGui::TextColored(ui::colorMuted, "Lap %d", lap.number);
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - 120.0f);
+        ImGui::TextColored(ui::colorText, "%s", lap.elapsed.c_str());
+        ImGui::Separator();
+    }
+    ImGui::EndChild();
+}
+
+void drawTimerPage(ClockState &state)
+{
+    ImGui::BeginChild("timer-panel", ImVec2(0.0f, 0.0f), true);
+    ImGui::Dummy(ImVec2(0.0f, 70.0f));
+    centerText(state.timerTotalSeconds > 0 ? formatDuration(state.timerRemainingSeconds) : "00:00:00", 2.35f,
+               state.timerRunning ? ui::colorGreen : ui::colorAccent);
+    ImGui::Spacing();
+
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (ImGui::GetContentRegionAvail().x - 174.0f) * 0.5f));
+    ImGui::PushItemWidth(174.0f);
+    if (state.timerRunning) {
+        ImGui::BeginDisabled();
+    }
+    if (ImGui::InputText("##timer-time", state.timerTimeText, sizeof(state.timerTimeText), ImGuiInputTextFlags_CharsDecimal)) {
+        parseTimeText(state.timerTimeText, true, 99, state.timerTime);
+    }
+    if (state.timerRunning) {
+        ImGui::EndDisabled();
+    }
+    ImGui::PopItemWidth();
+
+    ImGui::Spacing();
+    const float smallWidth = 82.0f;
+    const float presetWidth = smallWidth * 4.0f + ImGui::GetStyle().ItemSpacing.x * 3.0f;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (ImGui::GetContentRegionAvail().x - presetWidth) * 0.5f));
+    if (ui::subtleButton("5 min", ImVec2(smallWidth, 36.0f))) {
+        state.setTimerPreset(5);
+    }
+    ImGui::SameLine();
+    if (ui::subtleButton("10 min", ImVec2(smallWidth, 36.0f))) {
+        state.setTimerPreset(10);
+    }
+    ImGui::SameLine();
+    if (ui::subtleButton("25 min", ImVec2(smallWidth, 36.0f))) {
+        state.setTimerPreset(25);
+    }
+    ImGui::SameLine();
+    if (ui::subtleButton("Preview", ImVec2(smallWidth, 36.0f))) {
+        state.audio.previewTimer();
+    }
+
+    ImGui::Spacing();
+    const float buttonWidth = 120.0f;
+    const float groupWidth = buttonWidth * 2.0f + ImGui::GetStyle().ItemSpacing.x;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (ImGui::GetContentRegionAvail().x - groupWidth) * 0.5f));
+    const char *primary = state.timerRunning ? "Pause" : (state.timerRemainingSeconds > 0 ? "Resume" : "Start");
+    if (ui::accentButton(primary, ImVec2(buttonWidth, 46.0f), state.timerRunning ? ui::colorYellow : ui::colorGreen)) {
+        if (state.timerRunning) {
+            state.pauseTimer();
+        } else if (state.timerRemainingSeconds > 0) {
+            state.resumeTimer();
+        } else {
+            state.startTimer();
+        }
+    }
+    ImGui::SameLine();
+    if (ui::accentButton("Reset", ImVec2(buttonWidth, 46.0f), ui::colorLavender)) {
+        state.resetTimer();
+    }
+    ImGui::EndChild();
+}
+
+void drawRingingPopup(ClockState &state)
+{
+    if (state.ringing) {
+        ImGui::OpenPopup("Ringing");
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(430.0f, 190.0f), ImGuiCond_Always);
+    if (ImGui::BeginPopupModal("Ringing", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
+        centerText(state.ringingTitle, 1.35f, ui::colorText);
+        centerText(state.ringingMessage, 1.0f, ui::colorMuted);
+        ImGui::Spacing();
+        if (centeredAccentButton("Stop", 120.0f, ui::colorRed)) {
+            state.audio.stop();
+            state.ringing = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
+void drawClocks(ClockState &state, int width, int height, bool &running)
+{
+    if (!ImGui::GetIO().WantTextInput) {
+        if (ui::pressedAny({ImGuiKey_Escape, ImGuiKey_Q})) {
+            running = false;
+        }
+        if (ui::pressedAny({ImGuiKey_H, ImGuiKey_K, ImGuiKey_LeftArrow, ImGuiKey_UpArrow})) {
+            state.page = (state.page + 3) % 4;
+        }
+        if (ui::pressedAny({ImGuiKey_L, ImGuiKey_J, ImGuiKey_RightArrow, ImGuiKey_DownArrow})) {
+            state.page = (state.page + 1) % 4;
+        }
+    }
+
+    state.update();
+
+    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(static_cast<float>(width), static_cast<float>(height)));
+    ImGui::Begin("clocks", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+    drawTabs(state);
+    ImGui::Spacing();
+
+    ImGui::BeginChild("page", ImVec2(0.0f, 0.0f), false);
+    if (state.page == 0) {
+        drawWorldPage(state);
+    } else if (state.page == 1) {
+        drawAlarmsPage(state);
+    } else if (state.page == 2) {
+        drawStopwatchPage(state);
+    } else {
+        drawTimerPage(state);
+    }
+    ImGui::EndChild();
+
+    drawRingingPopup(state);
+    ImGui::End();
+}
+
+} // namespace
+
+int main()
+{
+    ClockState state;
+    ui::ImGuiApp app("clocks", windowWidth, windowHeight, 20.0f, true);
+    return app.run([&](bool &running) { drawClocks(state, app.width(), app.height(), running); });
+}

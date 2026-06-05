@@ -74,8 +74,8 @@ struct App {
     std::vector<std::unique_ptr<Bar>> bars;
 
     bool running = true;
-    int bar_height = 20;
-    int font_size = 10;
+    int bar_height = 22;
+    int font_size = 11;
     Color background{};
     bool position_top = true;
 };

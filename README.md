@@ -1,53 +1,44 @@
-# Qt Menus
+# dotfiles-utils
 
-Small Qt/QML menus for Hyprland.
+Native helper utilities for my Hyprland dotfiles.
 
-## Build
+## Build And Install
 
-```sh
-cmake --preset debug
-cmake --build --preset debug
-cmake --install build/debug
-```
-
-## Hyprland Launch Commands
-
-Lock menu:
+Release install to `~/.local`:
 
 ```sh
-hyprctl dispatch 'hl.dsp.exec_cmd("/home/falk/Work/Debug/qt-lock-menu/build/debug/lock-menu", { float = true, center = true, stay_focused = true })'
+cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOME/.local"
+cmake --build build/release --parallel
+cmake --install build/release
 ```
 
-Power profile menu:
+Debug build:
 
 ```sh
-hyprctl dispatch 'hl.dsp.exec_cmd("/home/falk/Work/Debug/qt-lock-menu/build/debug/power-menu", { float = true, center = true, stay_focused = true })'
+cmake -S . -B build/debug -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/debug --parallel
 ```
 
-Screenshot menu:
+The CMake project also defaults the install prefix to `$HOME/.local`. If no build type is provided, a build directory named `release` defaults to `Release`; other build directory names default to `Debug`.
 
-```sh
-hyprctl dispatch 'hl.dsp.exec_cmd("/home/falk/Work/Debug/qt-lock-menu/build/debug/screenshot-menu", { float = true, center = true, stay_focused = true })'
-```
+## Installed Tools
 
-Screen recording menu:
+- `lock-menu`
+- `power-menu`
+- `screenshot-menu`
+- `screenrecord-menu`
+- `idle-menu`
+- `clocks`
+- `minibar`
+- `screenfreeze`
+- `battery-daemon`
 
-```sh
-hyprctl dispatch 'hl.dsp.exec_cmd("/home/falk/Work/Debug/qt-lock-menu/build/debug/screenrecord-menu", { float = true, center = true, stay_focused = true })'
-```
-
-Idle inhibit menu:
-
-```sh
-hyprctl dispatch 'hl.dsp.exec_cmd("/home/falk/Work/Debug/qt-lock-menu/build/debug/idle-menu", { float = true, center = true, stay_focused = true })'
-```
-
-## Lua Bind Example
+## Hyprland Lua Example
 
 ```lua
 hl.bind(
     mainMod .. ' + SHIFT + L',
-    hl.dsp.exec_cmd('/home/falk/Work/Debug/qt-lock-menu/build/debug/lock-menu', {
+    hl.dsp.exec_cmd('~/.local/bin/lock-menu', {
         float = true,
         center = true,
         stay_focused = true,

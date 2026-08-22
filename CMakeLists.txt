@@ -116,6 +116,7 @@ endfunction()
 
 add_imgui_executable(lock-menu lock-menu.cpp)
 add_imgui_executable(power-menu power-menu.cpp)
+add_imgui_executable(layout-menu layout-menu.cpp)
 add_imgui_executable(screenshot-menu screenshot-menu.cpp)
 add_imgui_executable(screenrecord-menu screenrecord-menu.cpp)
 add_imgui_executable(idle-menu idle-menu.cpp)
@@ -157,7 +158,7 @@ target_link_libraries(screenfreeze
         PkgConfig::WAYLAND
 )
 
-install(TARGETS lock-menu power-menu screenshot-menu screenrecord-menu idle-menu clocks minibar screenfreeze battery-daemon
+install(TARGETS lock-menu power-menu layout-menu screenshot-menu screenrecord-menu idle-menu clocks minibar screenfreeze battery-daemon
     RUNTIME DESTINATION bin
 )
 

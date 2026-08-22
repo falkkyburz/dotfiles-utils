@@ -25,6 +25,7 @@ The CMake project also defaults the install prefix to `$HOME/.local`. If no buil
 
 - `lock-menu`
 - `power-menu`
+- `layout-menu`
 - `screenshot-menu`
 - `screenrecord-menu`
 - `idle-menu`

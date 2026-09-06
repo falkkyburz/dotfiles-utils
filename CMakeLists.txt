@@ -139,6 +139,11 @@ add_executable(screenfreeze screenfreeze.cpp ${WLR_CODE} ${XDG_CODE})
 add_dependencies(screenfreeze minibar_protocol_bindings)
 add_executable(battery-daemon battery.cpp)
 
+# Installed separately by chezmoi as a root-owned binary with CAP_PERFMON.
+# Do not install an unprivileged copy into ~/.local/bin: it would shadow that binary.
+add_executable(minibar-gpu-load minibar-gpu-load.c)
+target_compile_options(minibar-gpu-load PRIVATE -Wall -Wextra -Wpedantic)
+
 set_source_files_properties(${WLR_CODE} ${XDG_CODE} PROPERTIES LANGUAGE C)
 target_compile_options(minibar PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_options(screenfreeze PRIVATE -Wall -Wextra -Wpedantic)

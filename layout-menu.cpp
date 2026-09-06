@@ -2,31 +2,44 @@
 
 #include <cstdio>
 #include <string>
-#include <string_view>
 
 namespace {
 
-std::string readCurrentLayout()
+struct WorkspaceLayout {
+    std::string id;
+    std::string layout = "dwindle";
+};
+
+WorkspaceLayout readCurrentWorkspaceLayout()
 {
-    const std::string output = ui::readCommandOutput("hyprctl getoption general:layout 2>/dev/null");
-    constexpr std::string_view prefix = "str:";
-    const auto position = output.find(prefix);
-    if (position != std::string::npos) {
-        const auto end = output.find('\n', position);
-        return ui::trim(output.substr(position + prefix.size(), end - position - prefix.size()));
+    const std::string output = ui::readCommandOutput("hyprctl activeworkspace -j 2>/dev/null | jq -r '.id, .tiledLayout'");
+    const auto separator = output.find('\n');
+    if (separator != std::string::npos) {
+        const std::string id = ui::trim(output.substr(0, separator));
+        const std::string layout = ui::trim(output.substr(separator + 1));
+        const std::size_t digitsStart = id.starts_with('-') ? 1 : 0;
+        const bool validId = digitsStart < id.size() && id.find_first_not_of("0123456789", digitsStart) == std::string::npos;
+        if (validId && !layout.empty()) {
+            return {id, layout};
+        }
     }
     if (!output.empty()) {
-        std::fputs("layout-menu: failed to parse current Hyprland layout\n", stderr);
+        std::fputs("layout-menu: failed to parse current Hyprland workspace layout\n", stderr);
     }
-    return "dwindle";
+    return {};
 }
 
-void setLayout(const char *layout)
+void setLayout(const std::string& workspaceId, const char *layout)
 {
-    const std::string expression = std::string("hl.config({ general = { layout = \"") + layout + "\" } })";
+    if (workspaceId.empty()) {
+        std::fputs("layout-menu: failed to identify the current Hyprland workspace\n", stderr);
+        return;
+    }
+
+    const std::string expression = "hl.workspace_rule({ workspace = \"" + workspaceId + "\", layout = \"" + layout + "\" })";
     const std::string command = "hyprctl eval " + ui::shellQuote(expression) + " >/dev/null 2>&1";
     if (!ui::commandSucceeded(command)) {
-        std::fprintf(stderr, "layout-menu: failed to set Hyprland layout %s\n", layout);
+        std::fprintf(stderr, "layout-menu: failed to set layout %s for Hyprland workspace %s\n", layout, workspaceId.c_str());
     }
 }
 
@@ -34,7 +47,7 @@ void setLayout(const char *layout)
 
 int main()
 {
-    const std::string currentLayout = readCurrentLayout();
+    const auto [workspaceId, currentLayout] = readCurrentWorkspaceLayout();
     int selected = 0;
     if (currentLayout == "master") {
         selected = 1;
@@ -47,10 +60,10 @@ int main()
     return ui::runButtonMenu(
         "layout-menu", 240, 280,
         {
-            {"Dwindle", [] { setLayout("dwindle"); }, currentLayout == "dwindle"},
-            {"Master", [] { setLayout("master"); }, currentLayout == "master"},
-            {"Scrolling", [] { setLayout("scrolling"); }, currentLayout == "scrolling"},
-            {"Monocle", [] { setLayout("monocle"); }, currentLayout == "monocle"},
+            {"Dwindle", [workspaceId] { setLayout(workspaceId, "dwindle"); }, currentLayout == "dwindle"},
+            {"Master", [workspaceId] { setLayout(workspaceId, "master"); }, currentLayout == "master"},
+            {"Scrolling", [workspaceId] { setLayout(workspaceId, "scrolling"); }, currentLayout == "scrolling"},
+            {"Monocle", [workspaceId] { setLayout(workspaceId, "monocle"); }, currentLayout == "monocle"},
         },
         selected);
 }

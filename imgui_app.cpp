@@ -247,10 +247,10 @@ bool subtleButton(const char *label, const ImVec2 &size, bool active)
 
 bool destructiveButton(const char *label, const ImVec2 &size)
 {
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(colorRed.x, colorRed.y, colorRed.z, 0.08f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(colorRed.x, colorRed.y, colorRed.z, 0.16f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(colorRed.x, colorRed.y, colorRed.z, 0.24f));
-    ImGui::PushStyleColor(ImGuiCol_Text, colorRed);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(colorRed.x, colorRed.y, colorRed.z, 0.88f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, colorRed);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(colorRed.x * 0.78f, colorRed.y * 0.78f, colorRed.z * 0.78f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, colorBackground);
     const bool clicked = ImGui::Button(label, size);
     ImGui::PopStyleColor(4);
     return clicked;

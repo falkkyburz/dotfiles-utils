@@ -12,15 +12,13 @@ struct WorkspaceLayout {
 
 WorkspaceLayout readCurrentWorkspaceLayout()
 {
-    const std::string output = ui::readCommandOutput("hyprctl activeworkspace -j 2>/dev/null | jq -r '.id, .tiledLayout'");
+    const std::string output = ui::readCommandOutput("hyprctl activeworkspace -j 2>/dev/null | jq -r '.name, .tiledLayout'");
     const auto separator = output.find('\n');
     if (separator != std::string::npos) {
-        const std::string id = ui::trim(output.substr(0, separator));
+        const std::string name = ui::trim(output.substr(0, separator));
         const std::string layout = ui::trim(output.substr(separator + 1));
-        const std::size_t digitsStart = id.starts_with('-') ? 1 : 0;
-        const bool validId = digitsStart < id.size() && id.find_first_not_of("0123456789", digitsStart) == std::string::npos;
-        if (validId && !layout.empty()) {
-            return {id, layout};
+        if (!name.empty() && name != "null" && !layout.empty()) {
+            return {name, layout};
         }
     }
     if (!output.empty()) {
@@ -61,9 +59,9 @@ int main()
         "layout-menu", 240, 280,
         {
             {"Dwindle", [workspaceId] { setLayout(workspaceId, "dwindle"); }, currentLayout == "dwindle"},
-            {"Master", [workspaceId] { setLayout(workspaceId, "master"); }, currentLayout == "master"},
-            {"Scrolling", [workspaceId] { setLayout(workspaceId, "scrolling"); }, currentLayout == "scrolling"},
             {"Monocle", [workspaceId] { setLayout(workspaceId, "monocle"); }, currentLayout == "monocle"},
+            {"Scrolling", [workspaceId] { setLayout(workspaceId, "scrolling"); }, currentLayout == "scrolling"},
+            {"Master", [workspaceId] { setLayout(workspaceId, "master"); }, currentLayout == "master"},
         },
         selected);
 }

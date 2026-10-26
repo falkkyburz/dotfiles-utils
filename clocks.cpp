@@ -304,7 +304,9 @@ void centerText(const std::string &text, float scale, ImVec4 color)
 {
     ImGui::SetWindowFontScale(scale);
     const float width = ImGui::CalcTextSize(text.c_str()).x;
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (ImGui::GetContentRegionAvail().x - width) * 0.5f));
+    const float contentMin = ImGui::GetWindowContentRegionMin().x;
+    const float contentWidth = ImGui::GetWindowContentRegionMax().x - contentMin;
+    ImGui::SetCursorPosX(contentMin + std::max(0.0f, (contentWidth - width) * 0.5f));
     ImGui::TextColored(color, "%s", text.c_str());
     ImGui::SetWindowFontScale(1.0f);
 }
@@ -645,13 +647,19 @@ struct ClockState {
 void drawTabs(ClockState &state)
 {
     constexpr const char *titles[] = {"World", "Alarms", "Stopwatch", "Timer"};
-    const float tabWidth = 122.0f;
-    const float totalWidth = tabWidth * 4.0f + ImGui::GetStyle().ItemSpacing.x * 3.0f;
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (ImGui::GetContentRegionAvail().x - totalWidth) * 0.5f));
+    const float spacing = ImGui::GetStyle().ItemSpacing.x;
+    const float tabWidth = (ImGui::GetContentRegionAvail().x - spacing * 3.0f) / 4.0f;
     for (int i = 0; i < 4; ++i) {
         ImGui::PushID(i);
         const bool active = state.page == i;
-        const bool clicked = active ? ui::accentButton(titles[i], ImVec2(tabWidth, 42.0f)) : ui::subtleButton(titles[i], ImVec2(tabWidth, 42.0f));
+        ImGui::PushStyleColor(ImGuiCol_Button, active ? ImVec4(ui::colorAccent.x, ui::colorAccent.y, ui::colorAccent.z, 0.18f)
+                                                     : ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, active ? ImVec4(ui::colorAccent.x, ui::colorAccent.y, ui::colorAccent.z, 0.24f)
+                                                            : ui::colorButton);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ui::colorButtonHover);
+        ImGui::PushStyleColor(ImGuiCol_Text, active ? ui::colorAccent : ui::colorMuted);
+        const bool clicked = ImGui::Button(titles[i], ImVec2(tabWidth, 42.0f));
+        ImGui::PopStyleColor(4);
         if (clicked) {
             state.page = i;
         }
@@ -662,67 +670,112 @@ void drawTabs(ClockState &state)
     }
 }
 
+void drawPageAction(const char *label, const std::function<void()> &onAction)
+{
+    const float buttonWidth = 116.0f;
+    ImGui::SetCursorPosX(ImGui::GetWindowContentRegionMax().x - buttonWidth);
+    if (ui::accentButton(label, ImVec2(buttonWidth, 42.0f))) {
+        onAction();
+    }
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+}
+
+void drawEmptyState(const char *title)
+{
+    ImGui::Dummy(ImVec2(0.0f, 24.0f));
+    centerText(title, 1.25f, ui::colorText);
+}
+
+void drawWorldEditor(ClockState &state)
+{
+    ImGui::SetNextWindowSize(ImVec2(560.0f, 480.0f), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("Add a city", nullptr,
+                                ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+        return;
+    }
+
+    ImGui::SetNextItemWidth(-1.0f);
+    const bool appearing = ImGui::IsWindowAppearing();
+    ImGui::InputTextWithHint("##zone-filter", "Search by city or region", state.zoneFilter, sizeof(state.zoneFilter));
+    if (appearing) {
+        ImGui::SetKeyboardFocusHere(-1);
+    }
+
+    ImGui::BeginChild("zone-results", ImVec2(0.0f, -58.0f), true);
+    int shown = 0;
+    for (int i = 0; i < static_cast<int>(state.zones.size()); ++i) {
+        if (!containsInsensitive(state.zones[i], state.zoneFilter)) {
+            continue;
+        }
+        const bool selected = i == state.selectedZone;
+        const std::string label = zoneTitle(state.zones[i]);
+        ImGui::PushID(i);
+        if (ImGui::Selectable(label.c_str(), selected, ImGuiSelectableFlags_None, ImVec2(0.0f, 42.0f))) {
+            state.selectedZone = i;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", state.zones[i].c_str());
+        }
+        ImGui::PopID();
+        ++shown;
+    }
+    if (shown == 0) {
+        drawEmptyState("No matches");
+    }
+    ImGui::EndChild();
+
+    if (ui::subtleButton("Cancel", ImVec2(104.0f, 42.0f))) {
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - 104.0f);
+    if (ui::accentButton("Add", ImVec2(104.0f, 42.0f))) {
+        if (state.selectedZone >= 0 && state.selectedZone < static_cast<int>(state.zones.size())) {
+            state.addWorldClock(state.zones[state.selectedZone]);
+        }
+        state.zoneFilter[0] = '\0';
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 void drawWorldPage(ClockState &state)
 {
-    ImGui::PushItemWidth(std::min(360.0f, ImGui::GetContentRegionAvail().x - 130.0f));
-    ImGui::InputTextWithHint("##zone-filter", "Filter time zones", state.zoneFilter, sizeof(state.zoneFilter));
-    ImGui::PopItemWidth();
-    ImGui::SameLine();
-
-    const std::string preview = state.selectedZone >= 0 && state.selectedZone < static_cast<int>(state.zones.size()) ? state.zones[state.selectedZone] : "UTC";
-    ImGui::PushItemWidth(std::min(360.0f, ImGui::GetContentRegionAvail().x - 120.0f));
-    if (ImGui::BeginCombo("##zone-combo", preview.c_str())) {
-        for (int i = 0; i < static_cast<int>(state.zones.size()); ++i) {
-            if (!containsInsensitive(state.zones[i], state.zoneFilter)) {
-                continue;
-            }
-            const bool selected = i == state.selectedZone;
-            if (ImGui::Selectable(state.zones[i].c_str(), selected)) {
-                state.selectedZone = i;
-            }
-            if (selected) {
-                ImGui::SetItemDefaultFocus();
-            }
-        }
-        ImGui::EndCombo();
-    }
-    ImGui::PopItemWidth();
-    ImGui::SameLine();
-    if (ui::accentButton("Add", ImVec2(86.0f, 0.0f))) {
-        state.addWorldClock(preview);
-    }
-
-    ImGui::Separator();
+    drawPageAction("Add city", [] { ImGui::OpenPopup("Add a city"); });
     ImGui::BeginChild("world-scroll", ImVec2(0.0f, 0.0f), false);
     const float spacing = ImGui::GetStyle().ItemSpacing.x;
     const float width = ImGui::GetContentRegionAvail().x;
-    const int columns = width < 720.0f ? 1 : 2;
+    const int columns = width < 620.0f ? 1 : 2;
     const float cardWidth = columns == 1 ? width : (width - spacing) * 0.5f;
     int removeIndex = -1;
 
     for (int i = 0; i < static_cast<int>(state.worldZones.size()); ++i) {
+        const bool unpairedLastCard = columns == 2 && i == static_cast<int>(state.worldZones.size()) - 1 && i % 2 == 0;
+        if (unpairedLastCard) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (width - cardWidth) * 0.5f);
+        }
         ImGui::PushID(i);
-        ImGui::BeginChild("card", ImVec2(cardWidth, 132.0f), true);
-        ImGui::SetWindowFontScale(1.25f);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::colorPanel);
+        ImGui::BeginChild("card", ImVec2(cardWidth, 142.0f), true,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::SetWindowFontScale(1.05f);
         ImGui::TextColored(ui::colorText, "%s", zoneTitle(state.worldZones[i]).c_str());
         ImGui::SetWindowFontScale(1.0f);
-        ImGui::TextColored(ui::colorMuted, "%s", state.worldZones[i].c_str());
-        ImGui::Spacing();
-        ImGui::SetWindowFontScale(1.35f);
-        ImGui::TextColored(ui::colorAccent, "%s", formatInZone(state.worldZones[i], "%H:%M").c_str());
-        ImGui::SetWindowFontScale(1.0f);
         ImGui::SameLine();
-        ImGui::BeginGroup();
-        ImGui::TextColored(ui::colorText, "%s", formatInZone(state.worldZones[i], "%a, %b %d").c_str());
-        ImGui::TextColored(ui::colorMuted, "%s", offsetForZone(state.worldZones[i]).c_str());
-        ImGui::EndGroup();
+        const std::string offset = offsetForZone(state.worldZones[i]);
+        ImGui::TextColored(ui::colorMuted, "  %s", offset.c_str());
+        ImGui::Dummy(ImVec2(0.0f, 5.0f));
+        ImGui::SetWindowFontScale(1.7f);
+        ImGui::TextColored(ui::colorText, "%s", formatInZone(state.worldZones[i], "%H:%M").c_str());
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::TextColored(ui::colorMuted, "%s", formatInZone(state.worldZones[i], "%A, %B %d").c_str());
         if (state.worldZones.size() > 1) {
-            ImGui::SameLine(cardWidth - 104.0f);
-            if (ui::destructiveButton("Remove", ImVec2(92.0f, 34.0f))) {
+            ImGui::SetCursorPos(ImVec2(ImGui::GetWindowContentRegionMax().x - 72.0f, 102.0f));
+            if (ui::destructiveButton("Delete", ImVec2(72.0f, 32.0f))) {
                 removeIndex = i;
             }
         }
         ImGui::EndChild();
+        ImGui::PopStyleColor();
         ImGui::PopID();
 
         if (columns == 2 && i % 2 == 0 && i + 1 < static_cast<int>(state.worldZones.size())) {
@@ -734,73 +787,139 @@ void drawWorldPage(ClockState &state)
         state.worldZones.erase(state.worldZones.begin() + removeIndex);
     }
     ImGui::EndChild();
+    drawWorldEditor(state);
+}
+
+void drawAlarmEditor(ClockState &state)
+{
+    ImGui::SetNextWindowSize(ImVec2(520.0f, 280.0f), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("New alarm", nullptr,
+                                ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+        return;
+    }
+
+    ImGui::TextColored(ui::colorMuted, "Time");
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint("##alarm-time", "07:30", state.alarmTimeText, sizeof(state.alarmTimeText), ImGuiInputTextFlags_CharsDecimal);
+    ImGui::TextColored(ui::colorMuted, "Label");
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint("##alarm-label", "What is this alarm for?", state.alarmLabel, sizeof(state.alarmLabel));
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+
+    if (ui::subtleButton("Preview", ImVec2(104.0f, 42.0f))) {
+        state.audio.previewAlarm();
+    }
+    ImGui::SameLine();
+    if (ui::subtleButton("Cancel", ImVec2(104.0f, 42.0f))) {
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - 104.0f);
+    if (ui::accentButton("Create", ImVec2(104.0f, 42.0f))) {
+        if (parseTimeText(state.alarmTimeText, false, 23, state.alarmTime)) {
+            setTimeText(state.alarmTimeText, sizeof(state.alarmTimeText), state.alarmTime, false);
+            std::string label = ui::trim(state.alarmLabel);
+            state.alarms.push_back({state.alarmTime.hour, state.alarmTime.minute, label.empty() ? "Alarm" : label, true, {}});
+            state.alarmLabel[0] = '\0';
+            ImGui::CloseCurrentPopup();
+        }
+    }
+    ImGui::EndPopup();
+}
+
+bool toggleSwitch(const char *id, bool *value)
+{
+    const ImVec2 size(46.0f, 26.0f);
+    const bool pressed = ImGui::InvisibleButton(id, size);
+    if (pressed) {
+        *value = !*value;
+    }
+
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+    const float radius = size.y * 0.5f;
+    ImVec4 track = *value ? ui::colorAccent : ui::colorButtonHover;
+    if (ImGui::IsItemHovered()) {
+        track = *value ? ImVec4(std::min(track.x * 1.08f, 1.0f), std::min(track.y * 1.08f, 1.0f),
+                                std::min(track.z * 1.08f, 1.0f), 1.0f)
+                       : ui::colorBorder;
+    }
+    ImDrawList *draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(min, max, ImGui::ColorConvertFloat4ToU32(track), radius);
+    const float knobX = *value ? max.x - radius : min.x + radius;
+    draw->AddCircleFilled(ImVec2(knobX, min.y + radius), radius - 4.0f,
+                          ImGui::ColorConvertFloat4ToU32(*value ? ui::colorBackground : ui::colorMuted), 32);
+    return pressed;
 }
 
 void drawAlarmsPage(ClockState &state)
 {
-    ImGui::BeginChild("alarm-editor", ImVec2(0.0f, 104.0f), true);
-    ImGui::PushItemWidth(120.0f);
-    if (ImGui::InputText("##alarm-time", state.alarmTimeText, sizeof(state.alarmTimeText), ImGuiInputTextFlags_CharsDecimal)) {
-        parseTimeText(state.alarmTimeText, false, 23, state.alarmTime);
-    }
-    ImGui::PopItemWidth();
-    ImGui::SameLine();
-    ImGui::PushItemWidth(std::max(160.0f, ImGui::GetContentRegionAvail().x - 254.0f));
-    ImGui::InputTextWithHint("##alarm-label", "Label", state.alarmLabel, sizeof(state.alarmLabel));
-    ImGui::PopItemWidth();
-    ImGui::SameLine();
-    if (ui::accentButton("Add Alarm", ImVec2(118.0f, 0.0f))) {
-        parseTimeText(state.alarmTimeText, false, 23, state.alarmTime);
-        setTimeText(state.alarmTimeText, sizeof(state.alarmTimeText), state.alarmTime, false);
-        std::string label = ui::trim(state.alarmLabel);
-        state.alarms.push_back({state.alarmTime.hour, state.alarmTime.minute, label.empty() ? "Alarm" : label, true, {}});
-        state.alarmLabel[0] = '\0';
-    }
-    ImGui::SameLine();
-    if (ui::accentButton("Preview", ImVec2(100.0f, 0.0f), ui::colorLavender)) {
-        state.audio.previewAlarm();
-    }
-    ImGui::TextColored(ui::colorMuted, "Use HH:MM. Enabled alarms ring once per matching minute.");
-    ImGui::EndChild();
-
+    drawPageAction("New alarm", [] { ImGui::OpenPopup("New alarm"); });
     ImGui::BeginChild("alarm-list", ImVec2(0.0f, 0.0f), false);
     int removeIndex = -1;
     for (int i = 0; i < static_cast<int>(state.alarms.size()); ++i) {
         Alarm &alarm = state.alarms[i];
         ImGui::PushID(i);
-        ImGui::BeginChild("alarm-card", ImVec2(0.0f, 94.0f), true);
-        ImGui::Checkbox("##enabled", &alarm.enabled);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::colorPanel);
+        ImGui::BeginChild("alarm-card", ImVec2(0.0f, 104.0f), true,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        toggleSwitch("##enabled", &alarm.enabled);
         ImGui::SameLine();
-        ImGui::SetWindowFontScale(1.35f);
+        ImGui::SetWindowFontScale(1.55f);
         ImGui::TextColored(alarm.enabled ? ui::colorText : ui::colorMuted, "%s", alarmText(alarm.hour, alarm.minute).c_str());
         ImGui::SetWindowFontScale(1.0f);
-        ImGui::SameLine(170.0f);
+        ImGui::SameLine(190.0f);
         ImGui::BeginGroup();
         ImGui::TextColored(ui::colorText, "%s", alarm.label.c_str());
         ImGui::TextColored(ui::colorMuted, "%s", alarm.enabled ? remainingAlarmText(alarm.hour, alarm.minute).c_str() : "Off");
         ImGui::EndGroup();
-        ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - 100.0f);
-        if (ui::destructiveButton("Remove", ImVec2(92.0f, 34.0f))) {
+        ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 72.0f);
+        if (ui::destructiveButton("Delete", ImVec2(72.0f, 34.0f))) {
             removeIndex = i;
         }
         ImGui::EndChild();
+        ImGui::PopStyleColor();
         ImGui::PopID();
     }
     if (state.alarms.empty()) {
-        centerText("No alarms yet", 1.0f, ui::colorMuted);
+        drawEmptyState("No alarms yet");
     }
     if (removeIndex >= 0) {
         state.alarms.erase(state.alarms.begin() + removeIndex);
     }
     ImGui::EndChild();
+    drawAlarmEditor(state);
+}
+
+void drawProgressRing(float progress, ImVec4 color, float diameter)
+{
+    progress = std::clamp(progress, 0.0f, 1.0f);
+    const ImVec2 topLeft = ImGui::GetCursorScreenPos();
+    const ImVec2 center(topLeft.x + diameter * 0.5f, topLeft.y + diameter * 0.5f);
+    ImDrawList *draw = ImGui::GetWindowDrawList();
+    const ImU32 track = ImGui::ColorConvertFloat4ToU32(ImVec4(ui::colorBorder.x, ui::colorBorder.y, ui::colorBorder.z, 0.38f));
+    const ImU32 fill = ImGui::ColorConvertFloat4ToU32(color);
+    draw->AddCircle(center, diameter * 0.5f - 5.0f, track, 96, 8.0f);
+    if (progress > 0.001f) {
+        constexpr float start = -1.5707963f;
+        draw->PathArcTo(center, diameter * 0.5f - 5.0f, start, start + progress * 6.2831853f, 96);
+        draw->PathStroke(fill, 0, 8.0f);
+    }
+    ImGui::Dummy(ImVec2(diameter, diameter));
 }
 
 void drawStopwatchPage(ClockState &state)
 {
-    ImGui::BeginChild("stopwatch-display", ImVec2(0.0f, 210.0f), true);
-    ImGui::Dummy(ImVec2(0.0f, 28.0f));
-    centerText(formatMs(state.stopwatchElapsedMs()), 2.35f, ui::colorAccent);
-    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::colorPanel);
+    ImGui::BeginChild("stopwatch-display", ImVec2(0.0f, 330.0f), true,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    const float ringSize = 205.0f;
+    ImGui::SetCursorPosX((ImGui::GetWindowSize().x - ringSize) * 0.5f);
+    const ImVec2 ringPos = ImGui::GetCursorPos();
+    const long long elapsed = state.stopwatchElapsedMs();
+    drawProgressRing(static_cast<float>(elapsed % 60000) / 60000.0f, ui::colorAccent, ringSize);
+    ImGui::SetCursorPos(ImVec2(0.0f, ringPos.y + 74.0f));
+    centerText(formatMs(elapsed), 1.75f, ui::colorText);
+    ImGui::SetCursorPosY(ringPos.y + ringSize + 16.0f);
     const float buttonWidth = 116.0f;
     const float groupWidth = buttonWidth * 2.0f + ImGui::GetStyle().ItemSpacing.x;
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (ImGui::GetContentRegionAvail().x - groupWidth) * 0.5f));
@@ -812,30 +931,48 @@ void drawStopwatchPage(ClockState &state)
         state.stopwatchRunning ? state.addLap() : state.resetStopwatch();
     }
     ImGui::EndChild();
+    ImGui::PopStyleColor();
 
-    ImGui::BeginChild("laps", ImVec2(0.0f, 0.0f), true);
+    ImGui::BeginChild("laps", ImVec2(0.0f, 0.0f), false);
     if (state.laps.empty()) {
-        centerText("Laps appear here", 1.0f, ui::colorMuted);
+        drawEmptyState("No laps yet");
     }
     for (const Lap &lap : state.laps) {
-        ImGui::TextColored(ui::colorMuted, "Lap %d", lap.number);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::colorPanel);
+        ImGui::BeginChild(lap.number, ImVec2(0.0f, 52.0f), true,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::TextColored(ui::colorMuted, "Lap %02d", lap.number);
         ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - 120.0f);
         ImGui::TextColored(ui::colorText, "%s", lap.elapsed.c_str());
-        ImGui::Separator();
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
     }
     ImGui::EndChild();
 }
 
 void drawTimerPage(ClockState &state)
 {
-    ImGui::BeginChild("timer-panel", ImVec2(0.0f, 0.0f), true);
-    ImGui::Dummy(ImVec2(0.0f, 70.0f));
-    centerText(state.timerTotalSeconds > 0 ? formatDuration(state.timerRemainingSeconds) : "00:00:00", 2.35f,
-               state.timerRunning ? ui::colorGreen : ui::colorAccent);
-    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::colorPanel);
+    ImGui::BeginChild("timer-panel", ImVec2(0.0f, 0.0f), true,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    const float ringSize = 235.0f;
+    ImGui::SetCursorPosX((ImGui::GetWindowSize().x - ringSize) * 0.5f);
+    const ImVec2 ringPos = ImGui::GetCursorPos();
+    const float progress = state.timerTotalSeconds > 0
+                               ? static_cast<float>(state.timerRemainingSeconds) / static_cast<float>(state.timerTotalSeconds)
+                               : 0.0f;
+    drawProgressRing(progress, state.timerRunning ? ui::colorGreen : ui::colorAccent, ringSize);
+    ImGui::SetCursorPos(ImVec2(0.0f, ringPos.y + 83.0f));
+    centerText(state.timerTotalSeconds > 0 ? formatDuration(state.timerRemainingSeconds) : "00:00:00", 1.8f, ui::colorText);
+    ImGui::SetCursorPosY(ringPos.y + ringSize + 14.0f);
 
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (ImGui::GetContentRegionAvail().x - 174.0f) * 0.5f));
-    ImGui::PushItemWidth(174.0f);
+    constexpr float timerInputWidth = 174.0f;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (ImGui::GetContentRegionAvail().x - timerInputWidth) * 0.5f));
+    ImGui::PushItemWidth(timerInputWidth);
+    const ImGuiStyle &style = ImGui::GetStyle();
+    const float timerTextWidth = ImGui::CalcTextSize(state.timerTimeText).x;
+    const float timerTextPadding = std::max(style.FramePadding.x, (timerInputWidth - timerTextWidth) * 0.5f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(timerTextPadding, style.FramePadding.y));
     if (state.timerRunning) {
         ImGui::BeginDisabled();
     }
@@ -845,9 +982,10 @@ void drawTimerPage(ClockState &state)
     if (state.timerRunning) {
         ImGui::EndDisabled();
     }
+    ImGui::PopStyleVar();
     ImGui::PopItemWidth();
 
-    ImGui::Spacing();
+    ImGui::Dummy(ImVec2(0.0f, 2.0f));
     const float smallWidth = 82.0f;
     const float presetWidth = smallWidth * 4.0f + ImGui::GetStyle().ItemSpacing.x * 3.0f;
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (ImGui::GetContentRegionAvail().x - presetWidth) * 0.5f));
@@ -867,7 +1005,7 @@ void drawTimerPage(ClockState &state)
         state.audio.previewTimer();
     }
 
-    ImGui::Spacing();
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
     const float buttonWidth = 120.0f;
     const float groupWidth = buttonWidth * 2.0f + ImGui::GetStyle().ItemSpacing.x;
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (ImGui::GetContentRegionAvail().x - groupWidth) * 0.5f));
@@ -886,6 +1024,7 @@ void drawTimerPage(ClockState &state)
         state.resetTimer();
     }
     ImGui::EndChild();
+    ImGui::PopStyleColor();
 }
 
 void drawRingingPopup(ClockState &state)
@@ -920,9 +1059,28 @@ void drawClocks(ClockState &state, int width, int height, bool &running)
         if (ui::pressedAny({ImGuiKey_L, ImGuiKey_J, ImGuiKey_RightArrow, ImGuiKey_DownArrow})) {
             state.page = (state.page + 1) % 4;
         }
+        if (ImGui::IsKeyPressed(ImGuiKey_1, false)) {
+            state.page = 0;
+        } else if (ImGui::IsKeyPressed(ImGuiKey_2, false)) {
+            state.page = 1;
+        } else if (ImGui::IsKeyPressed(ImGuiKey_3, false)) {
+            state.page = 2;
+        } else if (ImGui::IsKeyPressed(ImGuiKey_4, false)) {
+            state.page = 3;
+        }
     }
 
     state.update();
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24.0f, 22.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(12.0f, 8.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 10.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 9.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 12.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 14.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 8.0f);
 
     ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
     ImGui::SetNextWindowSize(ImVec2(static_cast<float>(width), static_cast<float>(height)));
@@ -947,6 +1105,7 @@ void drawClocks(ClockState &state, int width, int height, bool &running)
 
     drawRingingPopup(state);
     ImGui::End();
+    ImGui::PopStyleVar(9);
 }
 
 } // namespace
